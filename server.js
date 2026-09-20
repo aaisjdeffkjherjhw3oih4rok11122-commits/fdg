@@ -779,6 +779,19 @@ function checkRateLimit(key) {
   return true;
 }
 
+// إصلاح تسريب ذاكرة بسيط: كانت الدالة فوق بتسيب مصفوفة فاضية [] في
+// الـ Map للأبد لأي IP اتصل ولو مرة واحدة (كانت بتتصفّر بس، مش بتتشال).
+// مع الوقت وعدد كبير من الزوار المختلفين، الـ Map كانت بتكبر بلا حدود.
+// الدالة دي بتشيل أي key فاضي تمامًا، وبنشغّلها دوريًا تحت.
+function pruneRateLimitStore() {
+  const now = Date.now();
+  for (const [key, arr] of rateLimitStore) {
+    const fresh = arr.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length === 0) rateLimitStore.delete(key);
+    else if (fresh.length !== arr.length) rateLimitStore.set(key, fresh);
+  }
+}
+
 function cleanupExpiredHashes() {
   const now = Date.now();
   for (const [hash, exp] of usedInitDataHashes) {
@@ -869,9 +882,22 @@ function dbUrl(env, path) {
   return `${base}/${path}.json`;
 }
 
+// ملاحظة مهمة (إصلاح تسريب الاتصالات/البورتات): في كل الدوال دي، لو الرد
+// مش ok لازم "نستهلك" الـ body بتاعه (res.text()) قبل ما نرمي الخطأ.
+// لو رمينا الخطأ من غير ما نقرأ الـ body، الـ socket بتاعه مايرجعش لـ
+// connection pool (keep-alive) والـ runtime بيضطر يفتح اتصال TCP+TLS
+// جديد (= بورت جديد) في كل مرة بدل إعادة استخدام الموجود. مع كثرة
+// الطلبات لـ Firebase ده كان بيستهلك كل البورتات المتاحة على الـ
+// container ("High ephemeral port usage" / EADDRNOTAVAIL في اللوج).
+async function drainAndThrow(res, label, path) {
+  let bodyText = '';
+  try { bodyText = await res.text(); } catch (_) {}
+  throw new Error(`${label} failed (${res.status}) on ${path}${bodyText ? ': ' + bodyText.slice(0, 300) : ''}`);
+}
+
 async function dbGet(env, path) {
   const res = await fetch(dbUrl(env, path));
-  if (!res.ok) throw new Error(`Firebase GET failed (${res.status}) on ${path}`);
+  if (!res.ok) return drainAndThrow(res, 'Firebase GET', path);
   return await res.json();
 }
 
@@ -881,7 +907,7 @@ async function dbSet(env, path, value) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
   });
-  if (!res.ok) throw new Error(`Firebase PUT failed (${res.status}) on ${path}`);
+  if (!res.ok) return drainAndThrow(res, 'Firebase PUT', path);
   return await res.json();
 }
 
@@ -891,7 +917,7 @@ async function dbUpdate(env, path, value) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
   });
-  if (!res.ok) throw new Error(`Firebase PATCH failed (${res.status}) on ${path}`);
+  if (!res.ok) return drainAndThrow(res, 'Firebase PATCH', path);
   return await res.json();
 }
 
@@ -901,20 +927,57 @@ async function dbPush(env, path, value) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
   });
-  if (!res.ok) throw new Error(`Firebase POST failed (${res.status}) on ${path}`);
+  if (!res.ok) return drainAndThrow(res, 'Firebase POST', path);
   const j = await res.json();
   return j.name;
 }
 
 async function dbDelete(env, path) {
   const res = await fetch(dbUrl(env, path), { method: 'DELETE' });
-  if (!res.ok) throw new Error(`Firebase DELETE failed (${res.status}) on ${path}`);
+  if (!res.ok) return drainAndThrow(res, 'Firebase DELETE', path);
+  // لازم نستهلك الـ body حتى في حالة النجاح عشان الـ socket يترجع لـ pool
+  try { await res.text(); } catch (_) {}
 }
 
 // ──────────────────────────────────────────────────────────────────────
 //  الإعدادات العامة للمشروع (config/) — كل القيم قابلة للتعديل من Firebase
 // ──────────────────────────────────────────────────────────────────────
+//  إصلاح مهم: getConfig() كانت بتتنادى في *كل طلب* يوصل للسيرفر (كل
+//  مستخدم، كل ضغطة زرار) وكانت بتعمل نداء لـ Firebase من غير أي كاش،
+//  وده كان أكبر سبب في ضغط الاتصالات الخارجة (نفس مشكلة استهلاك
+//  البورتات في اللوج). دلوقتي بنحتفظ بنسخة في الذاكرة لمدة قصيرة
+//  (CONFIG_CACHE_TTL_MS) ونرجّعها مباشرة من غير ما نكلم Firebase تاني
+//  إلا لو الكاش خلصت صلاحيته. أي تعديل يدوي على config/ من Firebase
+//  هياخد وقته يظهر (لحد TTL ثواني) بدل فورًا — ده تنازل بسيط جدًا مقابل
+//  تقليل ضخم في عدد الاتصالات.
+// ──────────────────────────────────────────────────────────────────────
+const CONFIG_CACHE_TTL_MS = 15 * 1000; // 15 ثانية
+let configCache = null;
+let configCacheExpiresAt = 0;
+let configCacheInFlight = null; // يمنع عدة طلبات متزامنة من ضرب Firebase مع بعض وقت انتهاء الكاش
+
 async function getConfig(env) {
+  const now = Date.now();
+  if (configCache && now < configCacheExpiresAt) {
+    return configCache;
+  }
+  if (configCacheInFlight) {
+    return configCacheInFlight;
+  }
+  configCacheInFlight = (async () => {
+    try {
+      const fresh = await getConfigUncached(env);
+      configCache = fresh;
+      configCacheExpiresAt = Date.now() + CONFIG_CACHE_TTL_MS;
+      return fresh;
+    } finally {
+      configCacheInFlight = null;
+    }
+  })();
+  return configCacheInFlight;
+}
+
+async function getConfigUncached(env) {
   let config = await dbGet(env, 'config');
   if (!config) config = {};
 
@@ -3173,9 +3236,20 @@ async function handleFetch(request, env) {
 
     // Railway بيحط IP العميل الحقيقي في X-Forwarded-For (Cloudflare كان بيحطه
     // في CF-Connecting-IP، فبنسيب الاتنين كـ fallback للتوافق).
+    //
+    // إصلاح أمني مهم: كنا بناخد *أول* قيمة في X-Forwarded-For. المشكلة إن
+    // ده هيدر أي عميل يقدر يبعته بنفسه، فسكريبت هجوم كان يقدر يبعت قيمة
+    // عشوائية مختلفة مع كل طلب ويظهر كـ "IP جديد" في كل مرة، وبالتالي
+    // يتخطى الـ Rate Limit بالكامل. الإصلاح: ناخد *آخر* قيمة في السلسلة،
+    // لأن الـ proxy بتاع المنصة (Railway) هو اللي بيضيفها في آخر السلسلة
+    // وهي دي القيمة اللي مش قابلة للتزوير من العميل. (لو المشروع خلف أكتر
+    // من proxy موثوق فيه، لازم تتأكد من عدد الـ hops الصح بدل آخر قيمة
+    // مباشرة — راجع توثيق Railway).
     const forwardedFor = request.headers.get('X-Forwarded-For') || '';
+    const forwardedIps = forwardedFor.split(',').map((s) => s.trim()).filter(Boolean);
     const ip = request.headers.get('CF-Connecting-IP')
-      || (forwardedFor ? forwardedFor.split(',')[0].trim() : '')
+      || (forwardedIps.length ? forwardedIps[forwardedIps.length - 1] : '')
+      || request.headers.get('X-Real-IP')
       || 'unknown';
     if (!checkRateLimit(ip)) {
       return fail('Too many requests, try later', 429);
@@ -3248,12 +3322,54 @@ async function handleFetch(request, env) {
 // ════════════════════════════════════════════════════════════════════
 import http from 'node:http';
 
+// ────────────────────────────────────────────────────────────────────
+//  حماية DoS (1): حد أقصى لحجم أي request body. قبل كده كان السيرفر
+//  بيقرأ الـ body بالكامل في الذاكرة *قبل* أي فحص (حتى قبل Rate Limit)
+//  وبدون أي حد أقصى، يعني أي سكريبت (بايثون مثلًا) يقدر يبعت body كبير
+//  جدًا أو يفتح اتصالات كتير كل واحدة ببودي كبير ويستهلك ذاكرة السيرفر
+//  بسرعة لحد ما الـ container يتقتل (OOM / "Killed"). دلوقتي بنرفض أي
+//  طلب حجمه أكبر من الحد ده فورًا ونقفل الاتصال، سواء اتحدد الحجم في
+//  Content-Length أو حتى لو مفيش Content-Length صحيح (بنعد الحجم الفعلي
+//  أثناء القراءة نفسها).
+// ────────────────────────────────────────────────────────────────────
+const MAX_BODY_BYTES = 256 * 1024; // 256KB كفاية جدًا لأي request JSON طبيعي في المشروع ده
+
+function sendTooLarge(res) {
+  try {
+    res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ success: false, error: 'Payload too large', serverTime: Date.now() }));
+  } catch (_) {}
+}
+
 const server = http.createServer(async (req, res) => {
   try {
+    // رفض مبكر لو العميل نفسه صرّح بحجم أكبر من المسموح (قبل ما نقرأ حاجة أصلًا)
+    const declaredLength = Number(req.headers['content-length'] || 0);
+    if (declaredLength > MAX_BODY_BYTES) {
+      sendTooLarge(res);
+      req.destroy();
+      return;
+    }
+
     // بنجمع الـ body كامل كـ Buffer عشان نبنيه كـ Web Request (زي ما كان
-    // بيوصل لـ Cloudflare Worker).
+    // بيوصل لـ Cloudflare Worker) — مع وقف فوري لو الحجم الفعلي تعدى الحد
+    // أثناء القراءة (بيحمي من طلبات بدون Content-Length صحيح أو مزوّر).
     const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
+    let receivedBytes = 0;
+    let tooLarge = false;
+    for await (const chunk of req) {
+      receivedBytes += chunk.length;
+      if (receivedBytes > MAX_BODY_BYTES) {
+        tooLarge = true;
+        break;
+      }
+      chunks.push(chunk);
+    }
+    if (tooLarge) {
+      sendTooLarge(res);
+      req.destroy();
+      return;
+    }
     const bodyBuffer = chunks.length ? Buffer.concat(chunks) : undefined;
 
     const host = req.headers.host || `localhost:${process.env.PORT || 3000}`;
@@ -3293,12 +3409,33 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// حماية DoS (2): حدود زمنية على مستوى الـ HTTP server نفسه. من غير كده،
+// سكريبت هجوم يقدر يفتح اتصالات كتير جدًا ويسيبها مفتوحة ببطء (يبعت
+// بيانات قطرة قطرة) عشان يستهلك موارد السيرفر (Slowloris-style) من غير
+// حتى ما يوصل لحد MAX_BODY_BYTES. الحدود دي بتقفل أي اتصال بياخد وقت
+// أطول من المعقول.
+server.headersTimeout = 15 * 1000;   // أقصى وقت لاستقبال الـ headers
+server.requestTimeout = 30 * 1000;   // أقصى وقت لاكتمال الطلب كله
+server.keepAliveTimeout = 20 * 1000; // مدة إبقاء الاتصال مفتوح بين الطلبات
+
 // Railway بيحدد البورت تلقائيًا عن طريق متغير PORT — لازم نسمعه بالظبط
 // وعلى 0.0.0.0 مش على localhost فقط.
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server is running on port ${PORT}`);
 });
+
+// ────────────────────────────────────────────────────────────────────
+//  تنظيف دوري للتخزين المؤقت في الذاكرة (Rate Limit / Replay Protection)
+//  قبل كده كان التنظيف بيحصل بس لما دالة معينة تتنادى بالصدفة، فالـ Maps
+//  دي كانت ممكن تكبر بلا حدود مع الوقت لو مفيش ترافيك يشغّل التنظيف.
+//  دلوقتي بنشغّله كل دقيقة بشكل مستقل ومضمون.
+// ────────────────────────────────────────────────────────────────────
+setInterval(() => {
+  try { pruneRateLimitStore(); } catch (_) {}
+  try { cleanupExpiredHashes(); } catch (_) {}
+  try { cleanupExpiredAdNonces(); } catch (_) {}
+}, 60 * 1000);
 
 // ════════════════════════════════════════════════════════════════════
 //  المسابقة الأسبوعية للإحالات — فحص دوري تلقائي (بديل Cron Job)
