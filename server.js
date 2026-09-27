@@ -507,6 +507,14 @@ function bufferToHex(buffer) {
   return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// تنظيف قيمة نصية قبل استخدامها كمفتاح/مقارنة (بصمة الجهاز مثلًا):
+// يُبقي فقط الحروف والأرقام و _ و - ويقصّ الطول. نفس الدالة تُستخدم في
+// /startAdView و /sessionSync و /claimAdReward، فالنتيجة متطابقة دائمًا.
+function afSanitiseKey(value, maxLen = 64) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/[^A-Za-z0-9_-]/g, '').slice(0, maxLen);
+}
+
 function generateReferralCode(telegramId) {
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `${String(telegramId).slice(-4)}${rand}`.slice(0, 10);
@@ -520,13 +528,19 @@ function generateReferralCode(telegramId) {
 // suffix, and falls back to a timestamp-based suffix that's guaranteed
 // unique if it somehow still collides after 5 tries.
 async function generateUniqueReferralCode(env, telegramId) {
+  const timestampCode = () => {
+    const suffix = (Date.now().toString(36) + Math.random().toString(36).slice(2, 5)).toUpperCase().slice(-6);
+    return `${String(telegramId).slice(-4)}${suffix}`.slice(0, 10);
+  };
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateReferralCode(telegramId);
     const lookup = await findUserByReferralCode(env, code);
+    // لو البحث نفسه فشل (مثلًا الـ index غير مضاف) لا نعتبر الكود فريدًا
+    // بالخطأ — نستخدم كودًا مبنيًا على الوقت + عشوائي بدل الاستمرار.
+    if (lookup.indexedQueryFailed) return timestampCode();
     if (!lookup.user) return code;
   }
-  const uniqueSuffix = Date.now().toString(36).toUpperCase().slice(-6);
-  return `${String(telegramId).slice(-4)}${uniqueSuffix}`.slice(0, 10);
+  return timestampCode();
 }
 
 function todayKeyUTC() {
@@ -653,6 +667,20 @@ async function dbSet(env, path, value) {
   });
   if (!res.ok) throw new Error(`Firebase PUT failed (${res.status}) on ${path}`);
   return await res.json();
+}
+
+// كتابة شرطية: تكتب القيمة فقط لو المسار فاضي فعلًا (Firebase ETag = null_etag).
+// ترجع true لو الكتابة تمت، false لو في request تاني سبقنا وكتب قيمة في نفس
+// المسار (HTTP 412) — وفي الحالة دي لا يتم استبدال أي شيء.
+async function dbSetIfAbsent(env, path, value) {
+  const res = await fetch(dbUrl(env, path), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'if-match': 'null_etag' },
+    body: JSON.stringify(value),
+  });
+  if (res.status === 412) return false;
+  if (!res.ok) throw new Error(`Firebase conditional PUT failed (${res.status}) on ${path}`);
+  return true;
 }
 
 async function dbUpdate(env, path, value) {
@@ -799,25 +827,102 @@ async function getMandatoryChannels(env) {
 // ──────────────────────────────────────────────────────────────────────
 //  المنطق الخاص بالمستخدمين
 // ──────────────────────────────────────────────────────────────────────
+const isMissingValue = (v) => v === undefined || v === null;
+
+// ─────────────────────────────────────────────────────────────────────
+//  repairUserData — يصلح الحقول الناقصة فقط للمستخدم الموجود.
+//   • لا يستخدم PUT على users/{id} أبدًا.
+//   • لا يغيّر أي قيمة موجودة (balance, referralCode, referredBy ...).
+//   • كل حقل ناقص يُكتب بـ PUT شرطي على مساره هو فقط (users/{id}/{field})
+//     ولا يتم إلا لو الحقل ما زال فاضيًا لحظة الكتابة. فلو request تاني
+//     كتب نفس الحقل في نفس اللحظة، الكتابة عندنا تُتجاهل ولا تمسح شيئًا.
+//   • ملاحظة: Firebase RTDB لا يخزّن null ولا المصفوفات الفاضية، فالحقول
+//     referredBy / comboClaimDate / completedTasks "الناقصة" هي فعليًا
+//     null / [] بطبيعتها — بتُضاف في الكائن المُرجَع فقط بدون أي كتابة.
+//  ترجع { user, missingFields } (user = نسخة مدموجة بالقيم الحالية).
+// ─────────────────────────────────────────────────────────────────────
+async function repairUserData(env, tgUser, existingUser) {
+  const telegramId = String(tgUser.id);
+  const path = `users/${telegramId}`;
+  const user = { ...(existingUser || {}) };
+
+  const storableDefaults = {
+    telegramId,
+    firstName: tgUser.first_name || '',
+    lastName: tgUser.last_name || '',
+    username: tgUser.username || '',
+    photoUrl: tgUser.photo_url || '',
+    languageCode: tgUser.language_code || '',
+    balance: 0,
+    tonBalance: 0,
+    wallet: '',
+    totalAdsWatched: 0,
+    wheelSpinsUsed: 0,
+    forceSubPassed: false,
+    createdAt: Date.now(),
+  };
+
+  const missingFields = [];
+  for (const key of Object.keys(storableDefaults)) {
+    if (isMissingValue(user[key])) missingFields.push(key);
+  }
+  const referralMissing = isMissingValue(user.referralCode);
+  if (referralMissing) missingFields.push('referralCode');
+
+  // حقول قيمتها الافتراضية null / [] : تُكمَّل في الذاكرة فقط (RTDB لا يخزنها).
+  if (user.referredBy === undefined) user.referredBy = null;
+  if (user.comboClaimDate === undefined) user.comboClaimDate = null;
+  if (isMissingValue(user.completedTasks)) user.completedTasks = [];
+
+  if (missingFields.length === 0) return { user, missingFields };
+
+  const toWrite = {};
+  for (const key of missingFields) {
+    if (key === 'referralCode') continue;
+    toWrite[key] = storableDefaults[key];
+  }
+  if (referralMissing) {
+    toWrite.referralCode = await generateUniqueReferralCode(env, telegramId);
+  }
+
+  const results = await Promise.all(Object.entries(toWrite).map(async ([field, value]) => {
+    try {
+      const written = await dbSetIfAbsent(env, `${path}/${field}`, value);
+      if (written) return [field, value];
+      // request تاني سبقنا: نقرأ القيمة اللي اتكتبت ونستخدمها بدل قيمتنا.
+      const current = await dbGet(env, `${path}/${field}`);
+      return [field, isMissingValue(current) ? value : current];
+    } catch (err) {
+      console.error(`repairUserData: failed to repair "${field}" for ${telegramId}:`, err);
+      return [field, value]; // نستخدمها في الرد الحالي، وتُعاد المحاولة في الطلب التالي
+    }
+  }));
+  for (const [field, value] of results) user[field] = value;
+
+  console.warn(`repairUserData: repaired [${missingFields.join(', ')}] for user ${telegramId}`);
+  return { user, missingFields };
+}
+
 async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) {
   const telegramId = String(tgUser.id);
-  let user = await dbGet(env, `users/${telegramId}`);
+  const userPath = `users/${telegramId}`;
+  let user = await dbGet(env, userPath);
+  let created = false;
 
   if (!user) {
     const referralCode = await generateUniqueReferralCode(env, telegramId);
     // بصمة الجهاز الجاية من الفرونت اند (device-fingerprint.client.js) —
-    // بتتخزن كحقل واحد بس جوه المستخدم نفسه، ومفيش أي مسار منفصل تاني
-    // (device_links, device_id_map... إلخ اتشالوا بالكامل).
+    // بتتخزن كحقل واحد بس جوه المستخدم نفسه.
     const deviceFingerprint = (body && typeof body._deviceFingerprint === 'string') ? body._deviceFingerprint : null;
-    user = {
+    const newUser = {
       telegramId,
       firstName: tgUser.first_name || '',
       lastName: tgUser.last_name || '',
       username: tgUser.username || '',
       photoUrl: tgUser.photo_url || '',
       languageCode: tgUser.language_code || '',
-       balance: 0,
-       tonBalance: 0,
+      balance: 0,
+      tonBalance: 0,
       wallet: '',
       referralCode,
       referredBy: null,
@@ -831,13 +936,22 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) 
       lastLogin: Date.now(),
     };
 
-    await dbSet(env, `users/${telegramId}`, user);
+    // إنشاء شرطي: لو request تاني أنشأ نفس المستخدم في نفس اللحظة، لا نكتب
+    // فوقه — نقرأ المستخدم الموجود ونكمل كمستخدم موجود.
+    created = await dbSetIfAbsent(env, userPath, newUser);
+    if (created) {
+      user = newUser;
+    } else {
+      user = await dbGet(env, userPath);
+      if (!user) throw new Error(`User ${telegramId} could not be created or read`);
+    }
+  }
+
+  if (created) {
+    const deviceFingerprint = user.deviceFingerprint || null;
 
     // ── حماية تعدد الحسابات: بتتفحص مرة واحدة بس هنا، لحظة إنشاء الحساب
-    // الجديد فعليًا (وليس على كل طلب بعد كده) — لو الجهاز ده مستخدم قبل
-    // كده مع حساب تاني، الحساب الجديد ده تحديدًا هو اللي هيتحظر فورًا
-    // (blocks/{telegramId})، والحظر هيتفحص في نقطة الدخول الرئيسية زي
-    // أي حساب محظور تاني. ─────────────────────────────────────────────
+    // الجديد فعليًا (وليس على كل طلب بعد كده). ─────────────────────────
     if (deviceFingerprint) {
       await guardNewAccountDevice(env, telegramId, deviceFingerprint);
     }
@@ -849,25 +963,34 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) 
     // لو الاشتراك الإجباري متوقف أو لا توجد قنوات مفعّلة، فعّل الإحالة فورًا
     const fsStatus = await checkUserForceSub(env, telegramId, botToken, config);
     if (fsStatus.passed) {
-      await dbUpdate(env, `users/${telegramId}`, { forceSubPassed: true });
+      await dbUpdate(env, userPath, { forceSubPassed: true });
       user.forceSubPassed = true;
       await activateReferralIfNeeded(env, telegramId, config, botToken);
     }
   } else {
-    user.firstName = tgUser.first_name || user.firstName;
-    user.lastName = tgUser.last_name || user.lastName;
-    user.username = tgUser.username || user.username;
-    user.photoUrl = tgUser.photo_url || user.photoUrl;
-    user.languageCode = tgUser.language_code || user.languageCode;
-    user.lastLogin = Date.now();
-    await dbUpdate(env, `users/${telegramId}`, {
-      firstName: user.firstName,
-      lastName: user.lastName,
-      username: user.username,
-      photoUrl: user.photoUrl,
-      languageCode: user.languageCode,
-      lastLogin: user.lastLogin,
-    });
+    // مستخدم موجود: نصلح الحقول الناقصة فقط (PATCH/PUT شرطي على كل حقل،
+    // بدون أي استبدال لبيانات موجودة).
+    const repaired = await repairUserData(env, tgUser, user);
+    user = repaired.user;
+
+    // مزامنة بيانات Telegram الحالية + آخر دخول: PATCH لهذه الحقول فقط،
+    // وفقط للحقول التي تغيّرت فعلًا.
+    const patch = { lastLogin: Date.now() };
+    const tgFields = {
+      firstName: tgUser.first_name,
+      lastName: tgUser.last_name,
+      username: tgUser.username,
+      photoUrl: tgUser.photo_url,
+      languageCode: tgUser.language_code,
+    };
+    for (const [key, tgValue] of Object.entries(tgFields)) {
+      if (tgValue && tgValue !== user[key]) {
+        patch[key] = tgValue;
+        user[key] = tgValue;
+      }
+    }
+    user.lastLogin = patch.lastLogin;
+    await dbUpdate(env, userPath, patch);
     await registerReferralIfNeeded(env, user, startParam, config);
   }
 
@@ -958,54 +1081,37 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
   }
 }
 
-// Returns { user, source, indexedQueryFailed, fallbackError }. The "source"
-// field tells the caller exactly how the answer was reached, so a
-// "not found" result can be told apart from a lookup that actually failed
-// (which used to be silently swallowed and looked identical to a genuine
-// miss in the debug logs — making real outages impossible to diagnose).
+// البحث عن مستخدم بكود الإحالة — باستعلام Firebase المفهرس فقط
+// (orderBy="referralCode"&equalTo=...&limitToFirst=1) فيرجع مستخدم واحد
+// بدل تحميل جدول users كله. تمت إزالة الـ fallback القديم الذي كان يقرأ
+// users بالكامل. لازم يكون في قواعد Firebase:
+//   "users": { ".indexOn": ["referralCode"] }
+// لو الاستعلام فشل يرجع { user: null, indexedQueryFailed: true } — والمستدعي
+// يتعامل معها كفشل مؤقت (لا يُسجَّل شيء وتُعاد المحاولة في الطلب التالي).
+// أكواد الإحالة كلها تُنشأ بحروف كبيرة، لذلك نحوّل المدخل لحروف كبيرة.
 async function findUserByReferralCode(env, code) {
+  const wanted = String(code || '').trim().toUpperCase();
+  if (!/^[A-Z0-9_-]{1,128}$/.test(wanted)) {
+    return { user: null, source: 'invalid_code', indexedQueryFailed: false, indexedQueryError: null };
+  }
   const base = env.FIREBASE_DATABASE_URL.replace(/\/$/, '');
-  const url = `${base}/users.json?orderBy=${encodeURIComponent('"referralCode"')}&equalTo=${encodeURIComponent('"' + code + '"')}`;
-  let indexedQueryFailed = false;
-  let indexedQueryError = null;
+  const url = `${base}/users.json?orderBy=${encodeURIComponent('"referralCode"')}&equalTo=${encodeURIComponent('"' + wanted + '"')}&limitToFirst=1`;
 
   try {
     const res = await fetch(url);
-    if (res.ok) {
-      const result = await res.json();
-      if (result) {
-        const key = Object.keys(result)[0];
-        if (key) return { user: result[key], source: 'indexed' };
-      }
-    } else {
-      indexedQueryFailed = true;
-      indexedQueryError = `HTTP ${res.status}`;
+    if (!res.ok) {
+      const msg = `HTTP ${res.status}`;
+      console.error(`findUserByReferralCode: indexed query failed (${msg}) — تأكد من إضافة ".indexOn": ["referralCode"] تحت users في Firebase Rules`);
+      return { user: null, source: 'indexed_failed', indexedQueryFailed: true, indexedQueryError: msg };
     }
+    const result = await res.json();
+    const key = result ? Object.keys(result)[0] : null;
+    if (key) return { user: result[key], source: 'indexed', indexedQueryFailed: false, indexedQueryError: null };
+    return { user: null, source: 'indexed_not_found', indexedQueryFailed: false, indexedQueryError: null };
   } catch (err) {
-    indexedQueryFailed = true;
-    indexedQueryError = String(err && err.message || err);
-  }
-
-  // Fallback in case Firebase rules or a missing index blocked the filtered
-  // query above. The user count is normally small enough that scanning the
-  // whole table server-side is fine, and this comparison is case-insensitive
-  // so a code copied in a different case still matches.
-  try {
-    const allUsers = await dbGet(env, 'users');
-    if (!allUsers) return { user: null, source: 'fallback_no_users', indexedQueryFailed, indexedQueryError };
-    const wanted = String(code).trim().toUpperCase();
-    const match = Object.values(allUsers).find((u) =>
-      String(u?.referralCode || '').trim().toUpperCase() === wanted
-    );
-    return { user: match || null, source: 'fallback', indexedQueryFailed, indexedQueryError };
-  } catch (err) {
-    return {
-      user: null,
-      source: 'fallback_error',
-      indexedQueryFailed,
-      indexedQueryError,
-      fallbackError: String(err && err.message || err),
-    };
+    const msg = String((err && err.message) || err);
+    console.error('findUserByReferralCode: indexed query error:', msg);
+    return { user: null, source: 'indexed_failed', indexedQueryFailed: true, indexedQueryError: msg };
   }
 }
 
