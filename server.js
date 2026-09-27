@@ -247,453 +247,170 @@ function rejectAdPulseError(env, telegramId, reasonCode) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  نظام الحماية ضد الاحتيال — Anti-Fraud System (10 طبقات)
+//  نظام الحماية ضد تعدد الحسابات (Device Fingerprint Multi-Account Guard)
+//  ------------------------------------------------------------------
+//  النسخة القديمة (10 طبقات) كانت بتعمل عدد كبير من عمليات القراءة/
+//  الكتابة على كل طلب واحد بس (devices/, device_links/, device_id_map/,
+//  device_signal_map/ لكل إشارة على حدة, ip_counters/, fraud_logs/,
+//  fraud_logs_common_fp/...)، لأن كل ده كان بينادى جوه checkAntiFraud
+//  على *كل* طلب API (كل الأكشنز، مش بس أول تسجيل دخول).
+//
+//  الكود ده اتشال بالكامل، ومكانه دلوقتي منطق واحد فقط، مبني حصريًا على
+//  اللي كان موجود في multi-account-protection.server.js اللي وصلني:
+//
+//    - checkUserBlocked  → قراءة واحدة بس (blocks/{id}) بتتنادى على كل
+//      طلب، بدل قراءة/كتابة عدة مسارات منفصلة زي الأول.
+//    - المسح الكامل لجدول users (checkDeviceFingerprintMultiAccount)،
+//      اللي هو العملية المكلفة فعلاً، بقى بينادى *مرة واحدة بس* لحظة
+//      إنشاء حساب جديد كليًا (جوه getOrCreateUser تحت) — مش على كل طلب.
+//    - مفيش تاني: مفيش device_links, device_id_map, device_signal_map,
+//      ip_counters, fraud_logs, fraud_logs_common_fp, devices/. بصمة
+//      الجهاز بقت بتتخزن كحقل واحد (deviceFingerprint) جوه users/{id}
+//      نفسه، ومفيش أي مسار إضافي منفصل.
 // ════════════════════════════════════════════════════════════════════
-const AF_FRAUD_SCORE_BLOCK       = 70;
-const AF_FRAUD_SCORE_WARN        = 40;
-// ── حماية تعدد الحسابات (Multi-Account Protection) ──────────────────
-// جهاز واحد = حساب واحد فقط. أي حساب إضافي يُنشأ من نفس الجهاز (سواء عبر
-// نفس بصمة الجهاز Device Fingerprint أو نفس معرف الجهاز المخزَّن محليًا)
-// يُحظر فورًا، بصرف النظر عن الـIP المستخدم. الحساب الأول الذي أُنشئ على
-// الجهاز لا يُحظر تلقائيًا أبدًا ويبقى مستثنى دائمًا (انظر firstOwner).
-const AF_MAX_ACCOUNTS_PER_DEVICE = 1;
+const MAG_BLOCKS_PATH = 'blocks';
+const MAG_USERS_PATH  = 'users';
 
-// ── ملحوظة مهمة (تحديث بعد رصد حظر خطأ كتير) ─────────────────────────
-// اتضح إن الـ fingerprint المُجمَّع (canvas+webgl+hardware+fonts+audio)
-// بيطلع *متطابق حرفيًا* بين أجهزة حقيقية مختلفة تمامًا لما تكون شغالة
-// جوه Telegram WebView — لأن كل الإشارات دي بتتحسب سوفتوير بحت من نفس
-// موديل الموبايل + نفس نسخة النظام + نفس نسخة تطبيق تليجرام، من غير أي
-// اعتماد على اختلافات هاردوير حقيقية زي المتصفحات العادية. يعني ملايين
-// المستخدمين اللي عندهم نفس موديل الموبايل الشائع ممكن يطلعلهم نفس الـ
-// fingerprint بالظبط، رغم إنهم بني آدمين مختلفين تمامًا.
-// عشان كده الـ fingerprint وحده بقى مش كافي يبني عليه حظر دائم فوري —
-// لو الـ fingerprint ده ظهر مرتبط بعدد حسابات كبير قبل كده (أكتر من
-// AF_FP_COMMON_THRESHOLD)، بقى واضح إنه "بصمة شائعة" (بيئة مش جهاز
-// مميز)، فمنوقف الاعتماد عليه في الحظر التلقائي ونكتفي بتسجيله للمراجعة.
-// أما الـ deviceId (المعرف العشوائي المخزَّن محليًا) فلسه أقوى دليل لأنه
-// UUID عشوائي حقيقي مالوش علاقة ببيئة السوفتوير، فاحتمال تطابقه بين
-// جهازين مختلفين شبه معدوم — لسه بيتعامل معاه كدليل حظر فوري.
-const AF_FP_COMMON_THRESHOLD = 4;
-
-// ── تحديث: مطابقة الإشارات المتعددة (Multi-Signal Overlap) ──────────
-// طبقة حماية إضافية بتتعامل تحديدًا مع اللي وصفناه فوق: مستخدم بيفتح
-// نفس الميني-آب من تطبيق تيليجرام تاني (تخزين WebView منفصل يصفّر
-// deviceId) أو بيغيّر الـ IP، فيتخطى فحصَي fingerprintReused/deviceIdReused
-// من غير ما يغيّر جهازه الفعلي أبدًا. راجع afCheckSignalOverlap وAF_WEIGHTS
-// فوق (multiSignalDeviceMatch) للتفاصيل.
-
-const AF_WEIGHTS = {
-  fingerprintReused:   35,
-  deviceIdReused:      30,
-  rapidAccountCreate:  20,
-  headlessBrowser:     25,
-  emulatorDetected:    20,
-  devToolsOpen:        10,
-  sameIpManyAccounts:  15,
-  fingerprintMissing:   5,
-  multiSignalDeviceMatch: 40,
-};
-
-// ── مطابقة إشارات فردية (Multi-Signal Overlap) ───────────────────────
-// المشكلة اللي الطبقة دي بتحلّها: الـ deviceId (UUID المخزَّن محليًا)
-// بيتصفّر لو المستخدم فتح الميني-آب من تطبيق تيليجرام تاني (تخزين
-// WebView منفصل) أو مسح بيانات التطبيق، وده بيدّي فرصة لتعدد الحسابات
-// من نفس الجهاز الفعلي من غير ما يتكرر أي deviceId. لكن الإشارات
-// الآتية من الجهاز/النظام مباشرة (canvas/webgl/hardware/fonts/audio/
-// media/uaHighEntropy) *لا تعتمد على تخزين التطبيق ولا على الـ IP* —
-// فهي بتفضل ثابتة لنفس الجهاز الفعلي حتى لو اتغيّر التطبيق أو الشبكة.
-// بدل ما نعتمد على "تطابق شامل" لكل الإشارات مجمّعة في هاش واحد (اللي
-// بيطلع شائع بين أجهزة مختلفة بنفس الموديل - انظر AF_FP_COMMON_THRESHOLD
-// فوق)، بنقارن كل إشارة لوحدها، ولو *نفس الحساب التاني بالتحديد* طابق
-// مع الحساب الحالي على عدد كافٍ من الإشارات القوية مع بعض (مش مجرد
-// إشارة واحدة شائعة)، ده دليل قوي جدًا إنه نفس الجهاز الفعلي — أقوى من
-// أي إشارة لوحدها ومستقل تمامًا عن الـ IP وعن تطبيق تيليجرام المستخدَم.
-const AF_STRONG_SIGNALS = ['hardwareHash', 'uaHash', 'fontsHash', 'webglHash'];
-const AF_WEAK_SIGNALS   = ['canvasHash', 'mediaHash', 'audioHash'];
-const AF_SIGNAL_INTERSECTION_MIN = 3; // عدد الإشارات القوية اللي لازم تتفق مع نفس الحساب التاني
-const AF_SIGNAL_MAX_TIDS_STORED  = 50; // حد أقصى للحسابات المخزَّنة تحت كل هاش إشارة (تفادي تضخّم غير محدود)
-
-async function afCheckSignalOverlap(env, signals, tid) {
-  const result = { intersectionOwner: null, matchedStrongCount: 0, anyWeakMatch: false, updates: [] };
-  if (!signals || typeof signals !== 'object') return result;
-
-  const perSignalOwners = {}; // signalName -> Set(tids matched, excluding self)
-  const allNames = AF_STRONG_SIGNALS.concat(AF_WEAK_SIGNALS);
-
-  for (const name of allNames) {
-    const raw = signals[name];
-    const hash = afSanitiseKey(typeof raw === 'string' ? raw : null, 64);
-    if (!hash || raw === 'unavailable') continue;
-    const path = `device_signal_map/${name}/${hash}`;
-    try {
-      const record = await dbGet(env, path);
-      const tids = record && Array.isArray(record.tids) ? record.tids.map(String).filter(afIsValidTid) : [];
-      const others = tids.filter((t) => t !== tid);
-      if (others.length) perSignalOwners[name] = new Set(others);
-      if (!tids.includes(tid)) {
-        const nextTids = tids.concat(tid).slice(-AF_SIGNAL_MAX_TIDS_STORED);
-        result.updates.push(dbSet(env, path, { tids: nextTids, lastSeen: Date.now() }));
-      }
-    } catch (_) {}
+// تنسيق البصمة لازم يكون SHA-256 (64 خانة hex) عشان نعتبرها موثوقة كفاية
+// نبني عليها حظر. أي حاجة تانية (زي fallback الـ base64 القصير لما
+// crypto.subtle مش متاح في المتصفح) بيتم تجاهلها بهدوء من غير حظر خطأ.
+function validateFingerprintFormat(fingerprint) {
+  if (!fingerprint || typeof fingerprint !== 'string') {
+    return { valid: false, error: 'Fingerprint is required' };
   }
-
-  // احسب أي حساب "تاني" اتكرر عبر أكبر عدد من الإشارات *القوية*
-  const tally = {};
-  for (const name of AF_STRONG_SIGNALS) {
-    const set = perSignalOwners[name];
-    if (!set) continue;
-    set.forEach((otherTid) => { tally[otherTid] = (tally[otherTid] || 0) + 1; });
+  const sha256Regex = /^[a-f0-9]{64}$/i;
+  if (!sha256Regex.test(fingerprint)) {
+    return { valid: false, error: 'Invalid fingerprint format. Must be 64-character SHA-256 hash' };
   }
-  let bestTid = null, bestCount = 0;
-  for (const [otherTid, count] of Object.entries(tally)) {
-    if (count > bestCount) { bestTid = otherTid; bestCount = count; }
-  }
-  result.matchedStrongCount = bestCount;
-  if (bestCount >= AF_SIGNAL_INTERSECTION_MIN) result.intersectionOwner = bestTid;
-  result.anyWeakMatch = AF_WEAK_SIGNALS.some((name) => perSignalOwners[name] && perSignalOwners[name].size > 0);
-
-  try { await Promise.all(result.updates); } catch (_) {}
-  return result;
+  return { valid: true };
 }
 
-function afSanitiseKey(str, maxLen = 64) {
-  if (typeof str !== 'string') return null;
-  const clean = str.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, maxLen);
-  return clean.length >= 8 ? clean : null;
-}
-
-function afCalcScore(flags) {
-  let score = 0;
-  for (const [flag, active] of Object.entries(flags)) {
-    if (active && AF_WEIGHTS[flag]) score += AF_WEIGHTS[flag];
-  }
-  return Math.min(score, 100);
-}
-
-function afBuildReason(flags) {
-  const parts = [];
-  if (flags.deviceIdReused)     parts.push('Same device ID');
-  if (flags.multiSignalDeviceMatch) parts.push('Multiple independent device signals match another account');
-  if (flags.fingerprintReused)  parts.push('Same device fingerprint');
-  if (flags.rapidAccountCreate) parts.push('Multiple accounts created quickly');
-  if (flags.headlessBrowser)    parts.push('Headless browser');
-  if (flags.emulatorDetected)   parts.push('Suspected emulator');
-  if (flags.sameIpManyAccounts) parts.push('Multiple accounts from the same network');
-  return parts.length ? parts.join(' | ') : 'Suspicious activity';
-}
-
-// جامع الحسابات المرتبطة بنفس الجهاز (لعرضها في صفحة الحظر بالواجهة).
-// بيقرأ device_links/{fp} و device_id_map/{did}.tids، يستثني الحساب
-// الحالي، ويجيب بيانات العرض (الاسم/اليوزر/الصورة) من users/{id}.
-async function afGetLinkedAccounts(env, fp, did, excludeTid, maxCount = 10) {
-  const tids = new Set();
+// بتتنادى على كل طلب — قراءة واحدة بس (blocks/{userId}).
+async function checkUserBlocked(env, userId) {
   try {
-    if (fp) {
-      const links = await dbGet(env, `device_links/${fp}`);
-      if (links) Object.keys(links).filter(afIsValidTid).forEach((t) => tids.add(t));
+    const blockData = await dbGet(env, `${MAG_BLOCKS_PATH}/${userId}`);
+    if (!blockData) return false;
+    return {
+      isBlocked: true,
+      reason: blockData.reason || 'Account blocked',
+      violation: blockData.violation || 'UNKNOWN',
+      deviceFingerprint: blockData.deviceFingerprint || null,
+    };
+  } catch (error) {
+    console.error('Error checking user block:', error);
+    return false;
+  }
+}
+
+async function applyBlock(env, userId, blockData) {
+  try {
+    const blockInfo = {
+      userId,
+      reason: blockData.reason || 'System violation detected',
+      violation: blockData.violation || 'UNKNOWN',
+      appliedAt: Date.now(),
+      permanent: true,
+      action: blockData.action || 'UNKNOWN',
+      details: blockData.details || 'No details',
+      deviceFingerprint: blockData.deviceFingerprint || 'Unknown',
+    };
+    await dbSet(env, `${MAG_BLOCKS_PATH}/${userId}`, blockInfo);
+    await dbUpdate(env, `${MAG_USERS_PATH}/${userId}`, {
+      isBlocked: true,
+      blockReason: blockInfo.reason,
+      blockedAt: Date.now(),
+    });
+    return true;
+  } catch (error) {
+    console.error('Error applying block:', error);
+    return false;
+  }
+}
+
+// المسح الكامل لجدول users بحثًا عن حساب تاني بنفس بصمة الجهاز. مكلفة
+// نسبيًا (بتقرا كل المستخدمين)، فبتتنادى مرة واحدة بس عند إنشاء حساب
+// جديد فعليًا (guardNewAccountDevice تحت)، أبدًا على طلب مستخدم موجود.
+async function checkDeviceFingerprintMultiAccount(env, deviceFingerprint, currentUserId) {
+  try {
+    if (!deviceFingerprint) return { deviceAlreadyUsed: false };
+
+    const usersData = (await dbGet(env, MAG_USERS_PATH)) || {};
+    const existingAccounts = [];
+
+    for (const [userId, userData] of Object.entries(usersData)) {
+      if (String(userId) === String(currentUserId)) continue;
+      if (userData.deviceFingerprint !== deviceFingerprint) continue;
+      existingAccounts.push({ userId, joinDate: userData.createdAt || null });
     }
-    if (did) {
-      const didRecord = await dbGet(env, `device_id_map/${did}`);
-      if (didRecord && Array.isArray(didRecord.tids)) {
-        didRecord.tids.map(String).filter(afIsValidTid).forEach((t) => tids.add(t));
+
+    if (!existingAccounts.length) return { deviceAlreadyUsed: false };
+    return { deviceAlreadyUsed: true, existingAccounts };
+  } catch (error) {
+    console.error('Error checking device fingerprint:', error);
+    return { deviceAlreadyUsed: false };
+  }
+}
+
+// قائمة الحسابات المشتركة في نفس الجهاز — لعرضها في شاشة الحظر بالواجهة
+// فقط. بتتنادى مرة واحدة بس وقت ما نرجّع رد "محظور" فعليًا (نادر)، مش
+// على كل طلب عادي.
+async function getSharedAccountsForDevice(env, deviceFingerprint, excludeUserId) {
+  if (!deviceFingerprint) return [];
+  try {
+    const usersData = (await dbGet(env, MAG_USERS_PATH)) || {};
+    const shared = [];
+    for (const [uid, userData] of Object.entries(usersData)) {
+      if (String(uid) === String(excludeUserId)) continue;
+      if (userData.deviceFingerprint === deviceFingerprint) {
+        shared.push({
+          telegramId: uid,
+          name: userData.firstName || userData.username || 'Unknown',
+          username: userData.username || '',
+          photoUrl: userData.photoUrl || '',
+        });
       }
     }
-  } catch (_) {}
-  tids.delete(String(excludeTid));
+    return shared;
+  } catch (error) {
+    console.error('Error fetching shared accounts:', error);
+    return [];
+  }
+}
 
-  // شبكة أمان إضافية: حتى لو أي باج تاني (حالي أو مستقبلي) خلّى تِيد
-  // الحساب الحالي يتسرّب لمصفوفة الحسابات المرتبطة، الفلتر ده بيمنع ظهور
-  // الحساب لنفسه في القايمة تحت أي ظرف.
-  const ids = Array.from(tids)
-    .filter((t) => t !== String(excludeTid))
-    .slice(0, maxCount);
-  if (!ids.length) return [];
+// بتتنادى مرة واحدة بس، جوه getOrCreateUser فورًا بعد إنشاء حساب جديد
+// كليًا. لو بصمة الجهاز دي مستخدمة قبل كده مع حساب تاني، الحساب الجديد
+// ده تحديدًا هو اللي بيتحظر (الحساب/الحسابات الأقدم على نفس الجهاز
+// بيفضلوا مستثنيين دايمًا لأنهم أصلاً مش هيدخلوا هنا تاني).
+async function guardNewAccountDevice(env, userId, deviceFingerprint) {
+  if (!deviceFingerprint) return { blocked: false };
+  const formatCheck = validateFingerprintFormat(deviceFingerprint);
+  if (!formatCheck.valid) return { blocked: false };
 
-  const users = await Promise.all(ids.map((id) => dbGet(env, `users/${id}`).catch(() => null)));
-  return ids.map((id, i) => {
-    const u = users[i] || {};
-    return { telegramId: id, name: u.firstName || u.username || 'Unknown', username: u.username || '', photoUrl: u.photoUrl || '' };
+  const fingerprintCheck = await checkDeviceFingerprintMultiAccount(env, deviceFingerprint, userId);
+  if (!fingerprintCheck.deviceAlreadyUsed) return { blocked: false };
+
+  await applyBlock(env, userId, {
+    reason: 'Device multi-account violation - New account detected',
+    violation: 'DEVICE_MULTI_ACCOUNT',
+    action: 'initializeUser',
+    details: `Device fingerprint already used by ${fingerprintCheck.existingAccounts.length} other account(s)`,
+    deviceFingerprint,
   });
+
+  return { blocked: true };
 }
 
-// تحقّق إن معرّف التليجرام رقم حقيقي (سلسلة أرقام فقط)، مش فاضي ومش
-// النص الحرفي "undefined"/"null" (بيحصل لو تم استدعاء الدالة بمتغيّر
-// telegramId فاضي من غير قصد — كان بيتحوّل بـ String() لنص "undefined"
-// ويتسجّل في قاعدة البيانات كأنه "حساب تاني" حقيقي على الجهاز، ويسبب
-// حظر خطأ للحساب الحقيقي الوحيد على الجهاز ده).
-function afIsValidTid(t) {
-  return typeof t === 'string' && /^\d{1,20}$/.test(t);
-}
-
-async function checkAntiFraud(env, request, telegramId, body) {
-  const tid  = String(telegramId);
-  // لو المعرّف مش صالح (فاضي، أو undefined/null اتحوّل لنص بالغلط، أو
-  // مش رقم أصلاً) منوقفش على طول من غير ما نسجّل أي حاجة في الداتابيز —
-  // بدل ما نخلّي "حساب شبح" يتسجّل ويتحسب ضد حسابات حقيقية تانية بعد كده.
-  if (!afIsValidTid(tid)) {
-    return { blocked: false, referralBlocked: false, score: 0 };
+// بديل مبسّط لـ isReferralEligible القديمة: نفس فحص الحظر بالظبط (قراءة
+// واحدة)، مفيش أي مسار fraud_logs/violations منفصل تاني.
+async function isReferralEligible(env, telegramId) {
+  const blockCheck = await checkUserBlocked(env, telegramId);
+  if (blockCheck && blockCheck.isBlocked) {
+    return { eligible: false, reason: blockCheck.reason, reasonCode: blockCheck.violation };
   }
-  const ip   = request.headers.get('CF-Connecting-IP') || 'unknown';
-  const ua   = request.headers.get('User-Agent')       || '';
-  const rawFP  = body._deviceFingerprint || null;
-  const rawDID = body._deviceId          || null;
-  const suspFlags = body._suspiciousFlags || {};
-  // بصمات كل إشارة لوحدها (من نسخة الواجهة المحدَّثة). بتتخزن مع سجل
-  // الجهاز لأغراض المراجعة، وكمان بتُستخدم في مطابقة الإشارات المتعددة
-  // (afCheckSignalOverlap تحت) لاكتشاف نفس الجهاز الفعلي حتى لو اتغيّر
-  // تطبيق تيليجرام أو الـ IP أو اتصفّر deviceId.
-  const signals = (body._signals && typeof body._signals === 'object') ? body._signals : null;
-  const fp  = afSanitiseKey(rawFP,  64);
-  const did = afSanitiseKey(rawDID, 64);
-
-  // هل الحساب محظور مسبقاً؟
-  try {
-    const accountBlocked = await dbGet(env, `blocked_accounts/${tid}`);
-    if (accountBlocked) {
-      return { blocked: false, referralBlocked: true, reason: 'This account is banned from referral rewards' };
-    }
-  } catch (_) {}
-
-  const flags = {
-    fingerprintMissing:   !fp,
-    headlessBrowser:      !!suspFlags.headless,
-    emulatorDetected:     !!suspFlags.emulator,
-    devToolsOpen:         !!suspFlags.devtools,
-    fingerprintReused:    false,
-    deviceIdReused:       false,
-    rapidAccountCreate:   false,
-    sameIpManyAccounts:   false,
-    // إعلامي فقط — مالوش وزن في afCalcScore ومش بيدخل في قرار الحظر أبدًا.
-    // بيتسجّل في fraud_logs بس عشان الأدمن يقدر يلاحظ لو بصمة معينة بقت
-    // شائعة جدًا (يبقى مؤشر إن فيه حاجة غلط في جودة الـ fingerprint نفسه).
-    fingerprintCommonEnvironment: false,
-    // اتفاق عدة إشارات جهاز مستقلة (مش هاش واحد مجمّع) مع نفس الحساب
-    // التاني بالتحديد — دليل قوي على نفس الجهاز الفعلي، ومستقل عن الـ
-    // IP وعن تطبيق تيليجرام المستخدَم لفتح الميني-آب. انظر afCheckSignalOverlap.
-    multiSignalDeviceMatch: false,
-  };
-
-  let firstOwner = null;
-  let signalOverlapOwner = null;
-  const nowMs = Date.now();
-
-  // ── فحص الـ Fingerprint ──────────────────────────────────────────
-  if (fp) {
-    try {
-      const deviceRecord = await dbGet(env, `devices/${fp}`);
-      if (!deviceRecord) {
-        await dbSet(env, `devices/${fp}`, {
-          firstSeenAt: nowMs, firstTelegramId: tid,
-          fingerprint: fp, deviceId: did || '', ip, ua, count: 1,
-          signals: signals || null,
-        });
-      } else {
-        const recordedFirstOwner = String(deviceRecord.firstTelegramId);
-        // نسجّل firstOwner بس لو هو فعلاً حساب "تاني" غير الحساب الحالي —
-        // عشان نضمن إن الحقل ده مايتخزّنش على الحساب نفسه لو صادف إنه هو
-        // فعلاً أول مالك للجهاز ده أصلًا (بيحصل عادي عند تكرار نفس الطلب).
-        if (recordedFirstOwner !== tid) firstOwner = recordedFirstOwner;
-        // ملاحظة: لا يتم تفعيل fingerprintReused هنا مباشرة، القرار
-        // بيتم بناءً على عدد الحسابات الفعلي على الجهاز (AF_MAX_ACCOUNTS_PER_DEVICE) تحت.
-        await dbUpdate(env, `devices/${fp}`, {
-          count: (deviceRecord.count || 1) + 1, lastSeen: nowMs, lastIp: ip,
-        });
-      }
-
-      // رابط جهاز ↔ حساب
-      const linkPath = `device_links/${fp}/${tid}`;
-      const existingLink = await dbGet(env, linkPath);
-      // عدد الحسابات "التانية" (غير الحساب الحالي) المرتبطة بهذا الجهاز.
-      // ملحوظة إصلاح مهمة: لازم نستثني تِيد الحساب الحالي هنا بالظبط زي
-      // ما فحص الـ deviceId تحت بيعمل (didTids.includes(tid)) — لأنه لو
-      // وصل طلبين من نفس الحساب في نفس اللحظة (مثلاً تحميل أول مرة +
-      // heartbeat، أو إعادة محاولة بعد بطء شبكة)، ممكن يكون الرابط
-      // الخاص بيه هو نفسه اتسجل بالفعل من الطلب التاني قبل ما نوصل هنا،
-      // فيبقى "عدد الحسابات المرتبطة" شايف حساب نفسه بس ويحسبها تعدي
-      // الحد المسموح، ويحظر الحساب من نفسه (self-collision).
-      const allLinksBefore = await dbGet(env, `device_links/${fp}`);
-      const countBefore = allLinksBefore
-        ? Object.keys(allLinksBefore).filter((t) => t !== tid && afIsValidTid(t)).length
-        : 0;
-
-      if (!existingLink) {
-        // لو عدد الحسابات الحالي فعلاً وصل أو تعدى الحد المسموح...
-        if (countBefore >= AF_MAX_ACCOUNTS_PER_DEVICE) {
-          // ...لكن قبل ما نعتبرها حالة تعدد حسابات حقيقية، لازم نتأكد إن
-          // البصمة دي "مميزة" فعلاً. لو نفس الـ fp ده سبق وارتبط بعدد كبير
-          // من الحسابات المختلفة (>= AF_FP_COMMON_THRESHOLD)، ده مش دليل
-          // على شخص واحد بيعمل حسابات كتير — ده أقرب لبصمة بيئة شائعة
-          // (نفس موديل موبايل منتشر) بتتكرر بين ناس حقيقيين مختلفين.
-          // في الحالة دي منوقّفش المستخدم، بس نسجّلها للمراجعة فقط.
-          if (countBefore >= AF_FP_COMMON_THRESHOLD) {
-            flags.fingerprintCommonEnvironment = true;
-          } else {
-            flags.fingerprintReused = true;
-          }
-        }
-        await dbSet(env, linkPath, {
-          telegramId: tid, seenAt: nowMs, ip, deviceId: did || '',
-          rewarded: !flags.fingerprintReused,
-        });
-      }
-    } catch (_) {}
-  }
-
-  // ── فحص الـ Device ID ────────────────────────────────────────────
-  if (did) {
-    try {
-      const didPath = `device_id_map/${did}`;
-      const didRecord = await dbGet(env, didPath);
-      if (!didRecord) {
-        await dbSet(env, didPath, { firstTelegramId: tid, seenAt: nowMs, tids: [tid] });
-      } else {
-        const didOwner = String(didRecord.firstTelegramId);
-        const rawDidTids = Array.isArray(didRecord.tids) ? didRecord.tids.slice() : [didOwner];
-        // تجاهل أي تِيد شبح (فاضي/"undefined"/غير رقمي) — ميتحسبش كحساب
-        // حقيقي على الجهاز، وميمنعش الحساب الحالي من التسجيل الطبيعي.
-        const didTids = rawDidTids.map(String).filter(afIsValidTid);
-        if (!didTids.includes(tid)) {
-          if (didTids.length >= AF_MAX_ACCOUNTS_PER_DEVICE) {
-            flags.deviceIdReused = true;
-            if (!firstOwner && afIsValidTid(didOwner)) firstOwner = didOwner;
-          } else {
-            didTids.push(tid);
-            // لو الـ firstTelegramId المخزَّن كان شبح (زي "undefined")، نصلّحه
-            // ونخلّيه الحساب الحقيقي الأول اللي شايفينه دلوقتي.
-            const patch = { tids: didTids };
-            if (!afIsValidTid(didOwner)) patch.firstTelegramId = tid;
-            await dbUpdate(env, didPath, patch);
-          }
-        }
-      }
-    } catch (_) {}
-  }
-
-  // ── مطابقة الإشارات المتعددة (مستقلة تمامًا عن deviceId والـ IP) ──
-  // بتلقط حالة تعدد الحسابات من نفس الجهاز الفعلي حتى لو المستخدم فتح
-  // البوت من تطبيق تيليجرام تاني (فبيتصفّر deviceId) أو غيّر شبكته.
-  if (signals) {
-    try {
-      const overlap = await afCheckSignalOverlap(env, signals, tid);
-      if (overlap.intersectionOwner) {
-        flags.multiSignalDeviceMatch = true;
-        signalOverlapOwner = overlap.intersectionOwner;
-        if (!firstOwner) firstOwner = overlap.intersectionOwner;
-      }
-    } catch (_) {}
-  }
-
-  // ── فحص سرعة إنشاء الحسابات عبر IP ──────────────────────────────
-  try {
-    const ipKey  = `ip_counters/${ip.replace(/\./g, '_').replace(/:/g, '-').replace(/[^a-zA-Z0-9_\-]/g, '')}`;
-    const ipData = await dbGet(env, ipKey);
-    const oneHour = 60 * 60 * 1000;
-
-    if (!ipData) {
-      await dbSet(env, ipKey, { count: 1, firstSeen: nowMs, tids: [tid] });
-    } else {
-      const tids = (ipData.tids || []).filter(Boolean);
-      if (!tids.includes(tid)) {
-        tids.push(tid);
-        const freshCount = ipData.firstSeen && (nowMs - ipData.firstSeen) < oneHour ? tids.length : 1;
-        if (freshCount > 3) flags.sameIpManyAccounts = true;
-        if (freshCount > 5) flags.rapidAccountCreate  = true;
-        await dbUpdate(env, ipKey, { count: freshCount, tids: tids.slice(-20), lastSeen: nowMs });
-      }
-    }
-  } catch (_) {}
-
-  // ── حساب الدرجة وتسجيل الأحداث ──────────────────────────────────
-  const score = afCalcScore(flags);
-
-  if (score >= AF_FRAUD_SCORE_WARN) {
-    try {
-      await dbPush(env, 'fraud_logs', {
-        telegramId: tid, fingerprint: fp || 'missing', deviceId: did || 'missing',
-        ip, ts: nowMs, reason: afBuildReason(flags), score, flags,
-      });
-    } catch (_) {}
-  } else if (flags.fingerprintCommonEnvironment) {
-    // بيسجل حتى لو الدرجة صفر (الوزن = 0 عمدًا) — عشان الأدمن يقدر يراجع
-    // دوريًا أي fingerprint بقى "شائع" جدًا ويرفع/يخفض AF_FP_COMMON_THRESHOLD
-    // بناءً على بيانات حقيقية بدل تخمين.
-    try {
-      await dbPush(env, 'fraud_logs_common_fp', {
-        telegramId: tid, fingerprint: fp, ip, ts: nowMs,
-      });
-    } catch (_) {}
-  }
-
-  // ── قرار الحظر (مُعاد تصميمه لتقليل الحظر الخطأ) ─────────────────
-  // deviceId (UUID عشوائي مخزَّن محليًا) دليل قوي وموثوق — تطابقه بين
-  // حسابين مختلفين شبه مستحيل يحصل صدفة، فبيفضل يُحظر فورًا زي الأول.
-  //
-  // fingerprint (بصمة الجهاز المُجمَّعة) بقى أقل موثوقية جوه Telegram
-  // WebView (راجع تعليق AF_FP_COMMON_THRESHOLD فوق)، فبقى وحده مش كافي
-  // للحظر الفوري — لازم يتأكد بإشارة تانية توصل بالدرجة الكلية لحد
-  // AF_FRAUD_SCORE_BLOCK. لو مطابقة فقط من غير أي دليل إضافي، بيتسجل
-  // في fraud_logs ومكافآت الإحالة بتتوقف مؤقتًا، لكن الحساب نفسه
-  // مايتقفلش بشكل نهائي غلط.
-  // multiSignalDeviceMatch (اتفاق ≥3 إشارات جهاز قوية ومستقلة مع نفس
-  // الحساب التاني بالتحديد) بيتعامل معاه زي deviceIdReused — دليل قوي
-  // بنفس مستوى الثقة تقريبًا، ومصمم عشان يفضل شغال حتى لو المستخدم غيّر
-  // تطبيق تيليجرام أو الـ IP.
-  const hardBlock = flags.deviceIdReused || flags.multiSignalDeviceMatch;
-  const corroboratedFpBlock = flags.fingerprintReused && score >= AF_FRAUD_SCORE_BLOCK;
-
-  if (hardBlock || corroboratedFpBlock) {
-    const reason = 'Multiple accounts detected on the same device. Only the first account created on this device is allowed to use the bot.';
-    try {
-      await dbUpdate(env, `blocked_accounts/${tid}`, {
-        reason, reasonCode: 'multi_account', score, ts: nowMs,
-        firstOwner: firstOwner || 'unknown',
-        fingerprint: fp || null, deviceId: did || null,
-        signalOverlapOwner: signalOverlapOwner || null,
-        flags,
-      });
-    } catch (_) {}
-    let linkedAccounts = [];
-    try {
-      linkedAccounts = await afGetLinkedAccounts(env, fp, did, tid);
-      if (
-        signalOverlapOwner &&
-        signalOverlapOwner !== tid &&
-        !linkedAccounts.some((a) => a.telegramId === signalOverlapOwner)
-      ) {
-        const u = await dbGet(env, `users/${signalOverlapOwner}`).catch(() => null);
-        if (u) {
-          linkedAccounts.push({
-            telegramId: signalOverlapOwner,
-            name: u.firstName || u.username || 'Unknown',
-            username: u.username || '',
-            photoUrl: u.photoUrl || '',
-          });
-        }
-      }
-    } catch (_) {}
-    return { blocked: true, referralBlocked: true, reason, reasonCode: 'multi_account', score, linkedAccounts };
-  }
-
-  // مطابقة fingerprint وحدها من غير ما توصل لدرجة الحظر: نوقف مكافآت
-  // الإحالة بس كإجراء احترازي، من غير ما نمنع الحساب نفسه من استخدام
-  // البوت — لحد ما يتأكد بدليل إضافي أو يراجعها الأدمن يدويًا.
-  if (flags.fingerprintReused) {
-    return { blocked: false, referralBlocked: true, reason: 'Suspicious activity detected — referral rewards are temporarily paused pending review', reasonCode: 'fingerprint_review', score };
-  }
-
-  return { blocked: false, referralBlocked: false, score };
-}
-
-async function isReferralEligible(env, newUserTelegramId) {
-  try {
-    const tid = String(newUserTelegramId);
-    const blocked = await dbGet(env, `blocked_accounts/${tid}`);
-    if (blocked) return { eligible: false, reason: blocked.reason || 'Device banned', reasonCode: blocked.reasonCode };
-  } catch (_) {}
   return { eligible: true };
 }
 // ════════════════════════════════════════════════════════════════════
-//  نهاية نظام الحماية ضد الاحتيال
+//  نهاية نظام الحماية ضد تعدد الحسابات
 // ════════════════════════════════════════════════════════════════════
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1082,12 +799,16 @@ async function getMandatoryChannels(env) {
 // ──────────────────────────────────────────────────────────────────────
 //  المنطق الخاص بالمستخدمين
 // ──────────────────────────────────────────────────────────────────────
-async function getOrCreateUser(env, tgUser, startParam, config, botToken) {
+async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) {
   const telegramId = String(tgUser.id);
   let user = await dbGet(env, `users/${telegramId}`);
 
   if (!user) {
     const referralCode = await generateUniqueReferralCode(env, telegramId);
+    // بصمة الجهاز الجاية من الفرونت اند (device-fingerprint.client.js) —
+    // بتتخزن كحقل واحد بس جوه المستخدم نفسه، ومفيش أي مسار منفصل تاني
+    // (device_links, device_id_map... إلخ اتشالوا بالكامل).
+    const deviceFingerprint = (body && typeof body._deviceFingerprint === 'string') ? body._deviceFingerprint : null;
     user = {
       telegramId,
       firstName: tgUser.first_name || '',
@@ -1105,11 +826,21 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken) {
       totalAdsWatched: 0,
       wheelSpinsUsed: 0,
       forceSubPassed: false,
+      deviceFingerprint: deviceFingerprint || null,
       createdAt: Date.now(),
       lastLogin: Date.now(),
     };
 
     await dbSet(env, `users/${telegramId}`, user);
+
+    // ── حماية تعدد الحسابات: بتتفحص مرة واحدة بس هنا، لحظة إنشاء الحساب
+    // الجديد فعليًا (وليس على كل طلب بعد كده) — لو الجهاز ده مستخدم قبل
+    // كده مع حساب تاني، الحساب الجديد ده تحديدًا هو اللي هيتحظر فورًا
+    // (blocks/{telegramId})، والحظر هيتفحص في نقطة الدخول الرئيسية زي
+    // أي حساب محظور تاني. ─────────────────────────────────────────────
+    if (deviceFingerprint) {
+      await guardNewAccountDevice(env, telegramId, deviceFingerprint);
+    }
 
     // تسجيل الإحالة بعد حفظ المستخدم، حتى يمكن إعادة المحاولة أيضًا
     // إذا كان المستخدم قد فتح التطبيق سابقًا بدون رابط دعوة.
@@ -1152,21 +883,11 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken) {
 async function registerReferralIfNeeded(env, user, startParam, config) {
   const telegramId = String(user.telegramId);
 
-  // ───── تسجيل تشخيصي (Debug): بيسجّل كل مرة يوصل فيها start_param
-  // للسيرفر بغض النظر عن نجاح أو فشل الربط، عشان تقدر تتابع في
-  // Firebase تحت debug_referral_attempts/<telegramId> هل الكود
-  // وصل من الأساس، وهل لقى المُحيل ولا لأ، من غير ما تحتاج تفحص
-  // الكود أو تسأل المستخدم أسئلة كتير كل مرة.
-  const logAttempt = async (extra) => {
-    try {
-      await dbSet(env, `debug_referral_attempts/${telegramId}`, {
-        startParamReceived: startParam || null,
-        alreadyHadReferrer: !!user.referredBy,
-        ts: Date.now(),
-        ...extra,
-      });
-    } catch (_) {}
-  };
+  // ───── تسجيل تشخيصي (Debug) اتلغى بالكامل بناءً على طلبك: مبقاش بيتكتب
+  // أي حاجة تحت debug_referral_attempts/<telegramId> في Firebase. الدالة
+  // سايبينها كـ no-op (بدل ما نحذف كل نداءاتها من الكود) عشان منضطرش
+  // نلمس منطق الإحالة نفسه في الأسفل.
+  const logAttempt = async () => {};
 
   if (!startParam) {
     await logAttempt({ result: 'no_start_param' });
@@ -1426,8 +1147,31 @@ async function chargeTonBalance(env, telegramId, amount) {
   return { ok: true, tonBalance: newBalance };
 }
 
+// أقصى عدد سجلات بلانس لوج يتم الاحتفاظ بيها لكل مستخدم. بعد كل عملية
+// إضافة، بيتم مسح أي سجلات أقدم من آخر BALANCE_LOG_MAX_ENTRIES تلقائيًا
+// (انظر trimBalanceLogs تحت) عشان الحجم في قاعدة البيانات ميكبرش من غير
+// حد أقصى مع الوقت.
+const BALANCE_LOG_MAX_ENTRIES = 15;
+
+// بتمسح أي سجلات بلانس لوج زيادة عن آخر BALANCE_LOG_MAX_ENTRIES لمستخدم
+// معيّن. مفاتيح Firebase push (اللي بيرجّعها dbPush) بترتّب أبجديًا بنفس
+// ترتيب الوقت اللي اتكتبت بيه، فبنرتّبها ونمسح الأقدم بس.
+async function trimBalanceLogs(env, telegramId, maxEntries = BALANCE_LOG_MAX_ENTRIES) {
+  try {
+    const all = await dbGet(env, `balanceLogs/${telegramId}`);
+    if (!all) return;
+    const keys = Object.keys(all).sort();
+    if (keys.length <= maxEntries) return;
+    const toDelete = keys.slice(0, keys.length - maxEntries);
+    await Promise.all(toDelete.map((k) => dbDelete(env, `balanceLogs/${telegramId}/${k}`).catch(() => {})));
+  } catch (_) {
+    // فشل التنضيف لا يوقف تسجيل الرصيد نفسه.
+  }
+}
+
 async function addBalanceLog(env, telegramId, logEntry) {
   await dbPush(env, `balanceLogs/${telegramId}`, logEntry);
+  await trimBalanceLogs(env, telegramId);
 
   // عمولة المحيل 10% من أرباح المستخدم المُحال.
   if (Number(logEntry.amount || 0) > 0 &&
@@ -1441,14 +1185,14 @@ async function addBalanceLog(env, telegramId, logEntry) {
       const referral = referrerId
         ? await dbGet(env, `referrals/${referrerId}/${telegramId}`)
         : null;
-      const blocked = await dbGet(env, `blocked_accounts/${telegramId}`);
+      const blockCheck = await checkUserBlocked(env, telegramId);
       const commission = Math.floor(Number(logEntry.amount) * 0.10);
       // العمولة 10% تُستحق بمجرد اكتمال (تفعيل) الإحالة — أي بعد صرف
       // مكافأة الإحالة الفردية (status === 'completed'). النظام القديم
       // القائم على 3 أيام (status === 'active') لم يعد له وجود.
       if (referrerId && referral?.status === 'completed' &&
           Number(referredUser?.totalAdsWatched || 0) >= 10 &&
-          !blocked && commission > 0) {
+          !(blockCheck && blockCheck.isBlocked) && commission > 0) {
         await incrementBalance(env, referrerId, commission);
         await dbPush(env, `balanceLogs/${referrerId}`, {
           type: 'referral_commission',
@@ -1457,6 +1201,7 @@ async function addBalanceLog(env, telegramId, logEntry) {
           sourceType: logEntry.type || 'earning',
           ts: Date.now(),
         });
+        await trimBalanceLogs(env, referrerId);
       }
     } catch (_) {
       // لا نوقف ربح المستخدم إذا تعذر تسجيل العمولة.
@@ -1486,14 +1231,9 @@ async function sendTelegramMessage(env, botToken, chatId, text) {
 // (في أي يوم)، تُصرف مكافأة الإحالة للمُحيل مباشرة ومرة واحدة فقط —
 // لا يوجد أي تقسيم للمكافأة على عدة أيام بعد الآن.
 async function activateReferralIfNeeded(env, telegramId, config, botToken) {
-  const logActivation = async (extra) => {
-    try {
-      await dbSet(env, `debug_referral_activation/${telegramId}`, {
-        ts: Date.now(),
-        ...extra,
-      });
-    } catch (_) {}
-  };
+  // اتلغى بالكامل بناءً على طلبك: مبقاش بيتكتب أي حاجة تحت
+  // debug_referral_activation/<telegramId> في Firebase.
+  const logActivation = async () => {};
 
   const user = await dbGet(env, `users/${telegramId}`);
   if (!user || !user.referredBy) {
@@ -1526,13 +1266,8 @@ async function activateReferralIfNeeded(env, telegramId, config, botToken) {
   // ── فحص أهلية مكافأة الإحالة (Anti-Fraud) ──────────────────────
   const refEligibility = await isReferralEligible(env, telegramId);
   if (!refEligibility.eligible) {
-    // سجّل الرفض ثم توقف — الحساب يعمل لكن بدون مكافأة
-    try {
-      await dbPush(env, 'fraud_logs', {
-        type: 'referral_blocked', telegramId, referrerId,
-        reason: refEligibility.reason, ts: Date.now(),
-      });
-    } catch (_) {}
+    // الحساب يعمل عادي لكن من غير مكافأة إحالة — مفيش أي مسار fraud_logs
+    // منفصل بيتكتب فيه دلوقتي (اتشال بالكامل).
     await logActivation({ result: 'blocked_anti_fraud', referrerId, reason: refEligibility.reason });
     return;
   }
@@ -1791,7 +1526,7 @@ async function handleGetState(env, ctx) {
     ? await Promise.all(Object.entries(referralsRaw).map(async ([id, r]) => {
         const [referredUser, blocked, referredLogs] = await Promise.all([
           dbGet(env, `users/${id}`).catch(() => null),
-          dbGet(env, `blocked_accounts/${id}`).catch(() => null),
+          dbGet(env, `${MAG_BLOCKS_PATH}/${id}`).catch(() => null),
           dbGet(env, `balanceLogs/${id}`).catch(() => null),
         ]);
         const adsWatched = Number(referredUser?.totalAdsWatched || 0);
@@ -2382,11 +2117,13 @@ async function handleStartTask(env, ctx) {
     return fail("Reward already claimed");
   }
 
-  // لا نستبدل وقت بدء سابق لو موجود (عشان حد ما يقدر يعيد تعيين العداد
-  // بالضغط على "Join" تاني وتاني)
-  const existing = await dbGet(env, `taskStarts/${telegramId}/${taskId}`);
-  if (!existing) {
-    await dbSet(env, `taskStarts/${telegramId}/${taskId}`, Date.now());
+  // taskStarts/{telegramId}: مكان واحد بس لكل مستخدم بيحفظ آخر مهمة بدأها
+  // (مش سجل منفصل لكل taskId يتراكم مع الوقت). لو بدأ مهمة جديدة، القيمة
+  // القديمة بتتكتب فوقها تلقائيًا، ولو رجع لنفس المهمة اللي كان بدأها،
+  // ميتغيرش وقت البدء (عشان محدش يقدر يصفّر العداد بالضغط على "Join" تاني).
+  const existing = await dbGet(env, `taskStarts/${telegramId}`);
+  if (!existing || existing.taskId !== taskId) {
+    await dbSet(env, `taskStarts/${telegramId}`, { taskId, startedAt: Date.now() });
   }
 
   return ok({ taskId, waitSeconds: task.category === 'bots' ? BOT_TASK_WAIT_SECONDS : 0 });
@@ -2416,6 +2153,11 @@ async function handleVerifyTask(env, ctx) {
     return fail("Reward already claimed");
   }
 
+  // نفس المكان الواحد اللي اتحفظ فيه taskStarts/{telegramId} في
+  // /startTask — بنقراه مرة واحدة هنا ونستخدمه، وبعدين نمسحه لو خلصنا
+  // المهمة دي بالتحديد (تحت).
+  const startRecord = await dbGet(env, `taskStarts/${telegramId}`);
+
   if (task.category === 'bots') {
      // Bot tasks cannot be verified through Telegram Bot API. The server
      // records the link-open time and enforces a real BOT_TASK_WAIT_SECONDS
@@ -2424,7 +2166,7 @@ async function handleVerifyTask(env, ctx) {
      // the bot") as part of the fake/simplified verification UX — the
      // real enforced delay stays 15 seconds regardless of what the user
      // is told.
-    const startedAt = await dbGet(env, `taskStarts/${telegramId}/${taskId}`);
+    const startedAt = (startRecord && startRecord.taskId === taskId) ? startRecord.startedAt : null;
     if (!startedAt) {
        return fail('Open the bot, wait 5s, then tap Verify');
     }
@@ -2446,7 +2188,11 @@ async function handleVerifyTask(env, ctx) {
 
   await dbSet(env, `completedTasks/${telegramId}/${taskId}`, { completedAt: Date.now(), reward });
   await dbUpdate(env, `users/${telegramId}/completedTasks`, { [taskId]: true });
-  await dbDelete(env, `taskStarts/${telegramId}/${taskId}`).catch(() => {});
+  // امسح مكان الـ taskStarts بتاع اليوزر ده — بس لو لسه بيشاور على نفس
+  // المهمة اللي خلصناها (لو كان بدأ مهمة تانية بعد كده، سيبها زي ما هي).
+  if (startRecord && startRecord.taskId === taskId) {
+    await dbDelete(env, `taskStarts/${telegramId}`).catch(() => {});
+  }
   await addBalanceLog(env, telegramId, {
     type: 'task_reward',
     taskId,
@@ -3262,31 +3008,24 @@ async function handleFetch(request, env) {
       const startParam = /^[A-Za-z0-9_-]{1,128}$/.test(String(rawStartParam))
         ? String(rawStartParam)
         : null;
-      const user = await getOrCreateUser(env, verification.user, startParam, config, botToken);
+      const user = await getOrCreateUser(env, verification.user, startParam, config, botToken, body);
 
-      // ── حظر الحساب من لوحة التحكم أو نظام مكافحة الاحتيال ──────────
-      // أي حساب موجود تحت blocked_accounts/{telegramId} يُمنع فورًا من
-      // استخدام أي إندبوينت في الـ API، مش بس مكافآت الإحالة.
-      try {
-        const accountBlocked = await dbGet(env, `blocked_accounts/${user.telegramId}`);
-        if (accountBlocked) {
-          let linkedAccounts = [];
-          try {
-            linkedAccounts = await afGetLinkedAccounts(env, accountBlocked.fingerprint, accountBlocked.deviceId, user.telegramId);
-          } catch (_) {}
-          return failBlocked(accountBlocked.reason, accountBlocked.reasonCode, linkedAccounts);
-        }
-      } catch (_) {}
-      // ─────────────────────────────────────────────────────────────
-
-      // ── طبقة الحماية ضد الاحتيال (تعدد الحسابات عبر بصمة الجهاز) ──
-      const fraudResult = await checkAntiFraud(env, request, user.telegramId, body);
-      if (fraudResult.blocked) {
-        return failBlocked(fraudResult.reason, fraudResult.reasonCode, fraudResult.linkedAccounts);
+      // ── حظر الحساب (نظام حماية تعدد الحسابات) ───────────────────────
+      // قراءة واحدة بس (blocks/{telegramId}) على كل طلب. المسح الكامل
+      // لجدول users بحثًا عن بصمة جهاز مكررة بقى بيحصل مرة واحدة بس عند
+      // إنشاء حساب جديد كليًا (جوه getOrCreateUser فوق)، مش هنا على كل
+      // طلب زي النظام القديم.
+      const blockCheck = await checkUserBlocked(env, user.telegramId);
+      if (blockCheck && blockCheck.isBlocked) {
+        let linkedAccounts = [];
+        try {
+          linkedAccounts = await getSharedAccountsForDevice(env, blockCheck.deviceFingerprint, user.telegramId);
+        } catch (_) {}
+        return failBlocked(blockCheck.reason, blockCheck.violation, linkedAccounts);
       }
       // ─────────────────────────────────────────────────────────────
 
-      const ctx = { user, body, tgUser: verification.user, config, botToken, botUsername, fraudResult, ip };
+      const ctx = { user, body, tgUser: verification.user, config, botToken, botUsername, ip };
       return await handler(env, ctx);
     } catch (err) {
       return fail('A server error occurred: ' + err.message, 500);
