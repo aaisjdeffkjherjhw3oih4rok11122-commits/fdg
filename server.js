@@ -327,7 +327,7 @@ async function afCheckSignalOverlap(env, signals, tid) {
     const path = `device_signal_map/${name}/${hash}`;
     try {
       const record = await dbGet(env, path);
-      const tids = record && Array.isArray(record.tids) ? record.tids.map(String) : [];
+      const tids = record && Array.isArray(record.tids) ? record.tids.map(String).filter(afIsValidTid) : [];
       const others = tids.filter((t) => t !== tid);
       if (others.length) perSignalOwners[name] = new Set(others);
       if (!tids.includes(tid)) {
@@ -390,11 +390,13 @@ async function afGetLinkedAccounts(env, fp, did, excludeTid, maxCount = 10) {
   try {
     if (fp) {
       const links = await dbGet(env, `device_links/${fp}`);
-      if (links) Object.keys(links).forEach((t) => tids.add(t));
+      if (links) Object.keys(links).filter(afIsValidTid).forEach((t) => tids.add(t));
     }
     if (did) {
       const didRecord = await dbGet(env, `device_id_map/${did}`);
-      if (didRecord && Array.isArray(didRecord.tids)) didRecord.tids.forEach((t) => tids.add(String(t)));
+      if (didRecord && Array.isArray(didRecord.tids)) {
+        didRecord.tids.map(String).filter(afIsValidTid).forEach((t) => tids.add(t));
+      }
     }
   } catch (_) {}
   tids.delete(String(excludeTid));
@@ -414,8 +416,23 @@ async function afGetLinkedAccounts(env, fp, did, excludeTid, maxCount = 10) {
   });
 }
 
+// تحقّق إن معرّف التليجرام رقم حقيقي (سلسلة أرقام فقط)، مش فاضي ومش
+// النص الحرفي "undefined"/"null" (بيحصل لو تم استدعاء الدالة بمتغيّر
+// telegramId فاضي من غير قصد — كان بيتحوّل بـ String() لنص "undefined"
+// ويتسجّل في قاعدة البيانات كأنه "حساب تاني" حقيقي على الجهاز، ويسبب
+// حظر خطأ للحساب الحقيقي الوحيد على الجهاز ده).
+function afIsValidTid(t) {
+  return typeof t === 'string' && /^\d{1,20}$/.test(t);
+}
+
 async function checkAntiFraud(env, request, telegramId, body) {
   const tid  = String(telegramId);
+  // لو المعرّف مش صالح (فاضي، أو undefined/null اتحوّل لنص بالغلط، أو
+  // مش رقم أصلاً) منوقفش على طول من غير ما نسجّل أي حاجة في الداتابيز —
+  // بدل ما نخلّي "حساب شبح" يتسجّل ويتحسب ضد حسابات حقيقية تانية بعد كده.
+  if (!afIsValidTid(tid)) {
+    return { blocked: false, referralBlocked: false, score: 0 };
+  }
   const ip   = request.headers.get('CF-Connecting-IP') || 'unknown';
   const ua   = request.headers.get('User-Agent')       || '';
   const rawFP  = body._deviceFingerprint || null;
@@ -496,7 +513,7 @@ async function checkAntiFraud(env, request, telegramId, body) {
       // الحد المسموح، ويحظر الحساب من نفسه (self-collision).
       const allLinksBefore = await dbGet(env, `device_links/${fp}`);
       const countBefore = allLinksBefore
-        ? Object.keys(allLinksBefore).filter((t) => t !== tid).length
+        ? Object.keys(allLinksBefore).filter((t) => t !== tid && afIsValidTid(t)).length
         : 0;
 
       if (!existingLink) {
@@ -531,14 +548,21 @@ async function checkAntiFraud(env, request, telegramId, body) {
         await dbSet(env, didPath, { firstTelegramId: tid, seenAt: nowMs, tids: [tid] });
       } else {
         const didOwner = String(didRecord.firstTelegramId);
-        const didTids  = Array.isArray(didRecord.tids) ? didRecord.tids.slice() : [didOwner];
+        const rawDidTids = Array.isArray(didRecord.tids) ? didRecord.tids.slice() : [didOwner];
+        // تجاهل أي تِيد شبح (فاضي/"undefined"/غير رقمي) — ميتحسبش كحساب
+        // حقيقي على الجهاز، وميمنعش الحساب الحالي من التسجيل الطبيعي.
+        const didTids = rawDidTids.map(String).filter(afIsValidTid);
         if (!didTids.includes(tid)) {
           if (didTids.length >= AF_MAX_ACCOUNTS_PER_DEVICE) {
             flags.deviceIdReused = true;
-            if (!firstOwner) firstOwner = didOwner;
+            if (!firstOwner && afIsValidTid(didOwner)) firstOwner = didOwner;
           } else {
             didTids.push(tid);
-            await dbUpdate(env, didPath, { tids: didTids });
+            // لو الـ firstTelegramId المخزَّن كان شبح (زي "undefined")، نصلّحه
+            // ونخلّيه الحساب الحقيقي الأول اللي شايفينه دلوقتي.
+            const patch = { tids: didTids };
+            if (!afIsValidTid(didOwner)) patch.firstTelegramId = tid;
+            await dbUpdate(env, didPath, patch);
           }
         }
       }
