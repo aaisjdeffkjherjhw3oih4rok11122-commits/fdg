@@ -45,44 +45,6 @@ if (typeof globalThis.crypto === 'undefined') {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-//  [FIX 5] حماية من وقوع السيرفر بسبب أي Promise فشل ومحدش عمله .catch
-//  (في Node 18+ ده كان بيقفل العملية كلها). بنسجّل الخطأ ونكمل شغل.
-//  ملحوظة: ده ما بيحميش من "Killed" (نفاد الذاكرة OOM) — دي بتتحل بالكاش
-//  وتقليل التحميل الكامل للجداول أدناه.
-// ──────────────────────────────────────────────────────────────────────
-process.on('unhandledRejection', (reason) => {
-  console.error('⚠️ unhandledRejection:', reason && reason.stack ? reason.stack : reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('⚠️ uncaughtException:', err && err.stack ? err.stack : err);
-});
-
-// ──────────────────────────────────────────────────────────────────────
-//  [FIX 4] تحديد عدد اتصالات الـ HTTP الخارجة (Firebase/Telegram/...) لكل
-//  origin عن طريق undici Agent — عشان ما نستنزفش بورتات النظام
-//  (EADDRNOTAVAIL). الطلبات الزيادة بتستنى في الطابور (ومحكومة بالـ timeout).
-//  لازم: npm i undici@6   (لو مش متثبّت السيرفر يكمل عادي بس من غير الحد ده)
-// ──────────────────────────────────────────────────────────────────────
-try {
-  const { Agent, setGlobalDispatcher } = await import('undici');
-  setGlobalDispatcher(new Agent({
-    connections: 64,            // أقصى عدد اتصالات متزامنة لكل origin
-    pipelining: 1,
-    keepAliveTimeout: 30_000,
-    keepAliveMaxTimeout: 60_000,
-    connectTimeout: 10_000,
-  }));
-  console.log('✅ undici Agent enabled (max 64 connections per origin)');
-} catch (err) {
-  console.warn('⚠️ undici not installed, outgoing connections are NOT capped. Run: npm i undici@6  —', err.message);
-}
-
-// [FIX 9] تنبيه لو الـ Node أقدم من 20 (Node 18 انتهى دعمه).
-if (Number(process.versions.node.split('.')[0]) < 20) {
-  console.warn(`⚠️ Running on Node ${process.version}. Please upgrade to Node 20 or 22 (set "engines" in package.json).`);
-}
-
-// ──────────────────────────────────────────────────────────────────────
 //  ثوابت عامة للنظام — كل القيم دي قابلة للتعديل من Firebase تحت config/
 //  العملة المستخدمة في كل أنحاء البوت: PMT
 //  (هذه القيم تُستخدم فقط كـ "قيمة مبدئية" أول مرة، ولا يتم الكتابة فوق
@@ -358,12 +320,10 @@ async function afCheckSignalOverlap(env, signals, tid) {
   const perSignalOwners = {}; // signalName -> Set(tids matched, excluding self)
   const allNames = AF_STRONG_SIGNALS.concat(AF_WEAK_SIGNALS);
 
-  // [SPEED] قراءات الإشارات السبعة كانت واحدة ورا التانية (7 رحلات متتالية لـ Firebase)،
-  // دلوقتي كلها بالتوازي — النتيجة نفسها بالظبط.
-  await Promise.all(allNames.map(async (name) => {
+  for (const name of allNames) {
     const raw = signals[name];
     const hash = afSanitiseKey(typeof raw === 'string' ? raw : null, 64);
-    if (!hash || raw === 'unavailable') return;
+    if (!hash || raw === 'unavailable') continue;
     const path = `device_signal_map/${name}/${hash}`;
     try {
       const record = await dbGet(env, path);
@@ -372,10 +332,10 @@ async function afCheckSignalOverlap(env, signals, tid) {
       if (others.length) perSignalOwners[name] = new Set(others);
       if (!tids.includes(tid)) {
         const nextTids = tids.concat(tid).slice(-AF_SIGNAL_MAX_TIDS_STORED);
-        result.updates.push(dbSet(env, path, { tids: nextTids, lastSeen: Date.now() }).catch(() => {})); // [FIX 5] كان سبب unhandled rejection
+        result.updates.push(dbSet(env, path, { tids: nextTids, lastSeen: Date.now() }));
       }
     } catch (_) {}
-  }));
+  }
 
   // احسب أي حساب "تاني" اتكرر عبر أكبر عدد من الإشارات *القوية*
   const tally = {};
@@ -439,7 +399,12 @@ async function afGetLinkedAccounts(env, fp, did, excludeTid, maxCount = 10) {
   } catch (_) {}
   tids.delete(String(excludeTid));
 
-  const ids = Array.from(tids).slice(0, maxCount);
+  // شبكة أمان إضافية: حتى لو أي باج تاني (حالي أو مستقبلي) خلّى تِيد
+  // الحساب الحالي يتسرّب لمصفوفة الحسابات المرتبطة، الفلتر ده بيمنع ظهور
+  // الحساب لنفسه في القايمة تحت أي ظرف.
+  const ids = Array.from(tids)
+    .filter((t) => t !== String(excludeTid))
+    .slice(0, maxCount);
   if (!ids.length) return [];
 
   const users = await Promise.all(ids.map((id) => dbGet(env, `users/${id}`).catch(() => null)));
@@ -449,7 +414,7 @@ async function afGetLinkedAccounts(env, fp, did, excludeTid, maxCount = 10) {
   });
 }
 
-async function checkAntiFraud(env, request, telegramId, body, opts = {}) {
+async function checkAntiFraud(env, request, telegramId, body) {
   const tid  = String(telegramId);
   const ip   = request.headers.get('CF-Connecting-IP') || 'unknown';
   const ua   = request.headers.get('User-Agent')       || '';
@@ -464,16 +429,13 @@ async function checkAntiFraud(env, request, telegramId, body, opts = {}) {
   const fp  = afSanitiseKey(rawFP,  64);
   const did = afSanitiseKey(rawDID, 64);
 
-  // هل الحساب محظور مسبقاً؟ [SPEED] handleFetch بيفحص ده قبل ما يناديني، فبيبعت
-  // skipBlockedCheck لتفادي قراءة مكررة لنفس المسار.
-  if (!opts.skipBlockedCheck) {
-    try {
-      const accountBlocked = await dbGet(env, `blocked_accounts/${tid}`);
-      if (accountBlocked) {
-        return { blocked: false, referralBlocked: true, reason: 'This account is banned from referral rewards' };
-      }
-    } catch (_) {}
-  }
+  // هل الحساب محظور مسبقاً؟
+  try {
+    const accountBlocked = await dbGet(env, `blocked_accounts/${tid}`);
+    if (accountBlocked) {
+      return { blocked: false, referralBlocked: true, reason: 'This account is banned from referral rewards' };
+    }
+  } catch (_) {}
 
   const flags = {
     fingerprintMissing:   !fp,
@@ -494,42 +456,49 @@ async function checkAntiFraud(env, request, telegramId, body, opts = {}) {
     multiSignalDeviceMatch: false,
   };
 
+  let firstOwner = null;
   let signalOverlapOwner = null;
   const nowMs = Date.now();
 
-  // [SPEED] الأقسام الأربعة (fingerprint / deviceId / إشارات الجهاز / IP) بتقرأ وتكتب في
-  // مسارات Firebase مختلفة تمامًا ومفيش بينها اعتماد، وكانت بتشتغل ورا بعض (حوالي 14 رحلة
-  // متتالية لـ Firebase قبل ما الطلب يبدأ فعليًا). دلوقتي بتشتغل بالتوازي، والقرار النهائي
-  // (firstOwner) بيتجمّع بنفس ترتيب الأولوية القديم: fingerprint ثم deviceId ثم الإشارات.
-
   // ── فحص الـ Fingerprint ──────────────────────────────────────────
-  const fpSection = async () => {
-    const out = { owner: null };
-    if (!fp) return out;
+  if (fp) {
     try {
-      const linkPath = `device_links/${fp}/${tid}`;
-      const [deviceRecord, existingLink, allLinksBefore] = await Promise.all([
-        dbGet(env, `devices/${fp}`),
-        dbGet(env, linkPath),
-        dbGet(env, `device_links/${fp}`), // عدد الحسابات الحالي على الجهاز (قبل إضافة الحساب الجديد)
-      ]);
-      const writes = [];
+      const deviceRecord = await dbGet(env, `devices/${fp}`);
       if (!deviceRecord) {
-        writes.push(dbSet(env, `devices/${fp}`, {
+        await dbSet(env, `devices/${fp}`, {
           firstSeenAt: nowMs, firstTelegramId: tid,
           fingerprint: fp, deviceId: did || '', ip, ua, count: 1,
           signals: signals || null,
-        }));
+        });
       } else {
-        out.owner = String(deviceRecord.firstTelegramId);
+        const recordedFirstOwner = String(deviceRecord.firstTelegramId);
+        // نسجّل firstOwner بس لو هو فعلاً حساب "تاني" غير الحساب الحالي —
+        // عشان نضمن إن الحقل ده مايتخزّنش على الحساب نفسه لو صادف إنه هو
+        // فعلاً أول مالك للجهاز ده أصلًا (بيحصل عادي عند تكرار نفس الطلب).
+        if (recordedFirstOwner !== tid) firstOwner = recordedFirstOwner;
         // ملاحظة: لا يتم تفعيل fingerprintReused هنا مباشرة، القرار
         // بيتم بناءً على عدد الحسابات الفعلي على الجهاز (AF_MAX_ACCOUNTS_PER_DEVICE) تحت.
-        writes.push(dbUpdate(env, `devices/${fp}`, {
+        await dbUpdate(env, `devices/${fp}`, {
           count: (deviceRecord.count || 1) + 1, lastSeen: nowMs, lastIp: ip,
-        }));
+        });
       }
 
-      const countBefore = allLinksBefore ? Object.keys(allLinksBefore).length : 0;
+      // رابط جهاز ↔ حساب
+      const linkPath = `device_links/${fp}/${tid}`;
+      const existingLink = await dbGet(env, linkPath);
+      // عدد الحسابات "التانية" (غير الحساب الحالي) المرتبطة بهذا الجهاز.
+      // ملحوظة إصلاح مهمة: لازم نستثني تِيد الحساب الحالي هنا بالظبط زي
+      // ما فحص الـ deviceId تحت بيعمل (didTids.includes(tid)) — لأنه لو
+      // وصل طلبين من نفس الحساب في نفس اللحظة (مثلاً تحميل أول مرة +
+      // heartbeat، أو إعادة محاولة بعد بطء شبكة)، ممكن يكون الرابط
+      // الخاص بيه هو نفسه اتسجل بالفعل من الطلب التاني قبل ما نوصل هنا،
+      // فيبقى "عدد الحسابات المرتبطة" شايف حساب نفسه بس ويحسبها تعدي
+      // الحد المسموح، ويحظر الحساب من نفسه (self-collision).
+      const allLinksBefore = await dbGet(env, `device_links/${fp}`);
+      const countBefore = allLinksBefore
+        ? Object.keys(allLinksBefore).filter((t) => t !== tid).length
+        : 0;
+
       if (!existingLink) {
         // لو عدد الحسابات الحالي فعلاً وصل أو تعدى الحد المسموح...
         if (countBefore >= AF_MAX_ACCOUNTS_PER_DEVICE) {
@@ -545,20 +514,16 @@ async function checkAntiFraud(env, request, telegramId, body, opts = {}) {
             flags.fingerprintReused = true;
           }
         }
-        writes.push(dbSet(env, linkPath, {
+        await dbSet(env, linkPath, {
           telegramId: tid, seenAt: nowMs, ip, deviceId: did || '',
           rewarded: !flags.fingerprintReused,
-        }));
+        });
       }
-      await Promise.all(writes);
     } catch (_) {}
-    return out;
-  };
+  }
 
   // ── فحص الـ Device ID ────────────────────────────────────────────
-  const didSection = async () => {
-    const out = { owner: null };
-    if (!did) return out;
+  if (did) {
     try {
       const didPath = `device_id_map/${did}`;
       const didRecord = await dbGet(env, didPath);
@@ -570,7 +535,7 @@ async function checkAntiFraud(env, request, telegramId, body, opts = {}) {
         if (!didTids.includes(tid)) {
           if (didTids.length >= AF_MAX_ACCOUNTS_PER_DEVICE) {
             flags.deviceIdReused = true;
-            out.owner = didOwner;
+            if (!firstOwner) firstOwner = didOwner;
           } else {
             didTids.push(tid);
             await dbUpdate(env, didPath, { tids: didTids });
@@ -578,50 +543,41 @@ async function checkAntiFraud(env, request, telegramId, body, opts = {}) {
         }
       }
     } catch (_) {}
-    return out;
-  };
+  }
 
   // ── مطابقة الإشارات المتعددة (مستقلة تمامًا عن deviceId والـ IP) ──
   // بتلقط حالة تعدد الحسابات من نفس الجهاز الفعلي حتى لو المستخدم فتح
   // البوت من تطبيق تيليجرام تاني (فبيتصفّر deviceId) أو غيّر شبكته.
-  const signalsSection = async () => {
-    const out = { owner: null };
-    if (!signals) return out;
+  if (signals) {
     try {
       const overlap = await afCheckSignalOverlap(env, signals, tid);
       if (overlap.intersectionOwner) {
         flags.multiSignalDeviceMatch = true;
         signalOverlapOwner = overlap.intersectionOwner;
-        out.owner = overlap.intersectionOwner;
+        if (!firstOwner) firstOwner = overlap.intersectionOwner;
       }
     } catch (_) {}
-    return out;
-  };
+  }
 
   // ── فحص سرعة إنشاء الحسابات عبر IP ──────────────────────────────
-  const ipSection = async () => {
-    try {
-      const ipKey  = `ip_counters/${ip.replace(/\./g, '_').replace(/:/g, '-').replace(/[^a-zA-Z0-9_\-]/g, '')}`;
-      const ipData = await dbGet(env, ipKey);
-      const oneHour = 60 * 60 * 1000;
+  try {
+    const ipKey  = `ip_counters/${ip.replace(/\./g, '_').replace(/:/g, '-').replace(/[^a-zA-Z0-9_\-]/g, '')}`;
+    const ipData = await dbGet(env, ipKey);
+    const oneHour = 60 * 60 * 1000;
 
-      if (!ipData) {
-        await dbSet(env, ipKey, { count: 1, firstSeen: nowMs, tids: [tid] });
-      } else {
-        const tids = (ipData.tids || []).filter(Boolean);
-        if (!tids.includes(tid)) {
-          tids.push(tid);
-          const freshCount = ipData.firstSeen && (nowMs - ipData.firstSeen) < oneHour ? tids.length : 1;
-          if (freshCount > 3) flags.sameIpManyAccounts = true;
-          if (freshCount > 5) flags.rapidAccountCreate  = true;
-          await dbUpdate(env, ipKey, { count: freshCount, tids: tids.slice(-20), lastSeen: nowMs });
-        }
+    if (!ipData) {
+      await dbSet(env, ipKey, { count: 1, firstSeen: nowMs, tids: [tid] });
+    } else {
+      const tids = (ipData.tids || []).filter(Boolean);
+      if (!tids.includes(tid)) {
+        tids.push(tid);
+        const freshCount = ipData.firstSeen && (nowMs - ipData.firstSeen) < oneHour ? tids.length : 1;
+        if (freshCount > 3) flags.sameIpManyAccounts = true;
+        if (freshCount > 5) flags.rapidAccountCreate  = true;
+        await dbUpdate(env, ipKey, { count: freshCount, tids: tids.slice(-20), lastSeen: nowMs });
       }
-    } catch (_) {}
-  };
-
-  const [fpRes, didRes, sigRes] = await Promise.all([fpSection(), didSection(), signalsSection(), ipSection()]);
-  const firstOwner = fpRes.owner || didRes.owner || sigRes.owner || null;
+    }
+  } catch (_) {}
 
   // ── حساب الدرجة وتسجيل الأحداث ──────────────────────────────────
   const score = afCalcScore(flags);
@@ -675,9 +631,20 @@ async function checkAntiFraud(env, request, telegramId, body, opts = {}) {
     let linkedAccounts = [];
     try {
       linkedAccounts = await afGetLinkedAccounts(env, fp, did, tid);
-      if (signalOverlapOwner && !linkedAccounts.some((a) => a.telegramId === signalOverlapOwner)) {
+      if (
+        signalOverlapOwner &&
+        signalOverlapOwner !== tid &&
+        !linkedAccounts.some((a) => a.telegramId === signalOverlapOwner)
+      ) {
         const u = await dbGet(env, `users/${signalOverlapOwner}`).catch(() => null);
-        if (u) linkedAccounts.push({ name: u.firstName || u.username || 'Unknown', username: u.username || '', photoUrl: u.photoUrl || '' });
+        if (u) {
+          linkedAccounts.push({
+            telegramId: signalOverlapOwner,
+            name: u.firstName || u.username || 'Unknown',
+            username: u.username || '',
+            photoUrl: u.photoUrl || '',
+          });
+        }
       }
     } catch (_) {}
     return { blocked: true, referralBlocked: true, reason, reasonCode: 'multi_account', score, linkedAccounts };
@@ -900,7 +867,7 @@ async function verifyTelegramInitData(initData, botToken) {
       return { valid: false, error: 'Invalid initData signature (check that BOT_TOKEN is correct)' };
     }
 
-    // [FIX 7] التنظيف بقى دوري (كل دقيقة) بدل loop على الـ Map كله مع كل طلب.
+    cleanupExpiredHashes();
     usedInitDataHashes.set(hash, Date.now() + INIT_DATA_MAX_AGE * 1000);
 
     const userJson = params.get('user');
@@ -931,68 +898,52 @@ function dbUrl(env, path) {
   return `${base}/${path}.json`;
 }
 
-// [FIX 3] fetch عام بـ timeout (بيغطي الاتصال + انتظار الطابور + قراءة الـ body).
-async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
-  return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
-}
-
-// [FIX 3] fbFetch: نقطة واحدة لكل طلبات Firebase — timeout 8 ثواني، ولو الرد
-// مش ok بنقفل الـ response body صراحةً (بدون كده الاتصال بيفضل معلّق ويتسرّب).
-const FB_TIMEOUT_MS = 8000;
-async function fbFetch(url, options = {}, label = '') {
-  const res = await fetchWithTimeout(url, options, FB_TIMEOUT_MS);
-  if (!res.ok) {
-    try { await res.body?.cancel(); } catch (_) {}
-    const err = new Error(`Firebase ${options.method || 'GET'} failed (${res.status})${label ? ` on ${label}` : ''}`);
-    err.status = res.status;
-    throw err;
-  }
-  return res;
-}
-
 async function dbGet(env, path) {
-  const res = await fbFetch(dbUrl(env, path), {}, path);
+  const res = await fetch(dbUrl(env, path));
+  if (!res.ok) throw new Error(`Firebase GET failed (${res.status}) on ${path}`);
   return await res.json();
 }
 
 async function dbSet(env, path, value) {
-  const res = await fbFetch(dbUrl(env, path), {
+  const res = await fetch(dbUrl(env, path), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
-  }, path);
+  });
+  if (!res.ok) throw new Error(`Firebase PUT failed (${res.status}) on ${path}`);
   return await res.json();
 }
 
 async function dbUpdate(env, path, value) {
-  const res = await fbFetch(dbUrl(env, path), {
+  const res = await fetch(dbUrl(env, path), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
-  }, path);
+  });
+  if (!res.ok) throw new Error(`Firebase PATCH failed (${res.status}) on ${path}`);
   return await res.json();
 }
 
 async function dbPush(env, path, value) {
-  const res = await fbFetch(dbUrl(env, path), {
+  const res = await fetch(dbUrl(env, path), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
-  }, path);
+  });
+  if (!res.ok) throw new Error(`Firebase POST failed (${res.status}) on ${path}`);
   const j = await res.json();
   return j.name;
 }
 
 async function dbDelete(env, path) {
-  const res = await fbFetch(dbUrl(env, path), { method: 'DELETE' }, path);
-  // الـ body صغير هنا لكن بنستهلكه عشان الاتصال يرجع للـ pool.
-  try { await res.body?.cancel(); } catch (_) {}
+  const res = await fetch(dbUrl(env, path), { method: 'DELETE' });
+  if (!res.ok) throw new Error(`Firebase DELETE failed (${res.status}) on ${path}`);
 }
 
 // ──────────────────────────────────────────────────────────────────────
 //  الإعدادات العامة للمشروع (config/) — كل القيم قابلة للتعديل من Firebase
 // ──────────────────────────────────────────────────────────────────────
-async function loadConfigFromFirebase(env) {
+async function getConfig(env) {
   let config = await dbGet(env, 'config');
   if (!config) config = {};
 
@@ -1060,32 +1011,6 @@ async function loadConfigFromFirebase(env) {
   return config;
 }
 
-// [FIX 8] كاش للإعدادات لمدة 30 ثانية: قبل كده كل طلب API كان بيقرأ config/ كاملة
-// من Firebase. أي تعديل يدوي في Firebase بيظهر خلال 30 ثانية كحد أقصى.
-// بنرجّع نسخة (clone) في كل مرة عشان أي كود بيعدّل الـ config ما يبوّظش الكاش،
-// ولو Firebase فشل مؤقتًا بنرجّع آخر نسخة ناجحة بدل ما نفشّل الطلب.
-const CONFIG_CACHE_TTL_MS = 30_000;
-const configCache = { data: null, at: 0, inflight: null };
-async function getConfig(env) {
-  if (configCache.data && Date.now() - configCache.at < CONFIG_CACHE_TTL_MS) {
-    return structuredClone(configCache.data);
-  }
-  if (!configCache.inflight) {
-    configCache.inflight = loadConfigFromFirebase(env)
-      .then((c) => { configCache.data = c; configCache.at = Date.now(); return c; })
-      .finally(() => { configCache.inflight = null; });
-  }
-  try {
-    return structuredClone(await configCache.inflight);
-  } catch (err) {
-    if (configCache.data) {
-      console.warn('⚠️ getConfig failed, serving stale config:', err.message);
-      return structuredClone(configCache.data);
-    }
-    throw err;
-  }
-}
-
 // تثبيت مهام الدعوة الثابتة *فقط لو غير موجودة* — لا يتم لمس أي مهمة
 // موجودة بالفعل حتى لو قيمها مختلفة عن القيم الافتراضية في الكود
 // (بهذا الشكل تقدر تعدّل reward/title/status لأي مهمة دعوة من Firebase
@@ -1115,12 +1040,7 @@ async function ensureFixedInviteTasks(env) {
 // قنوات الاشتراك الإجباري — تُنشأ بقيمة مبدئية مرة واحدة فقط لو العقدة
 // غير موجودة بالمرة في Firebase. لو صاحب المشروع مسح كل القنوات يدويًا
 // (عقدة فاضية {}) مش هيتم زرع القناة الافتراضية تاني.
-// [SPEED] كاش 30 ثانية لقائمة قنوات الاشتراك الإجباري (بتتقرا في كل getState).
-const mandatoryChannelsCache = { data: null, at: 0 };
 async function getMandatoryChannels(env) {
-  if (mandatoryChannelsCache.data && Date.now() - mandatoryChannelsCache.at < 30_000) {
-    return mandatoryChannelsCache.data.map((c) => ({ ...c }));
-  }
   let raw = await dbGet(env, 'mandatoryChannels');
   if (raw === null || raw === undefined) {
     const seed = {};
@@ -1130,12 +1050,9 @@ async function getMandatoryChannels(env) {
     await dbSet(env, 'mandatoryChannels', seed);
     raw = seed;
   }
-  const list = Object.entries(raw)
+  return Object.entries(raw)
     .map(([id, c]) => ({ id, ...c }))
     .filter((c) => c.status !== 'disabled' && c.status !== 'inactive');
-  mandatoryChannelsCache.data = list;
-  mandatoryChannelsCache.at = Date.now();
-  return list.map((c) => ({ ...c }));
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1188,26 +1105,21 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken) {
     user.photoUrl = tgUser.photo_url || user.photoUrl;
     user.languageCode = tgUser.language_code || user.languageCode;
     user.lastLogin = Date.now();
-    // [SPEED] تحديث بيانات الملف الشخصي وتسجيل الإحالة يخصّوا حقول مختلفة، فبيشتغلوا بالتوازي.
-    await Promise.all([
-      dbUpdate(env, `users/${telegramId}`, {
-        firstName: user.firstName,
-        lastName: user.lastName,
-        username: user.username,
-        photoUrl: user.photoUrl,
-        languageCode: user.languageCode,
-        lastLogin: user.lastLogin,
-      }),
-      registerReferralIfNeeded(env, user, startParam, config),
-    ]);
+    await dbUpdate(env, `users/${telegramId}`, {
+      firstName: user.firstName,
+      lastName: user.lastName,
+      username: user.username,
+      photoUrl: user.photoUrl,
+      languageCode: user.languageCode,
+      lastLogin: user.lastLogin,
+    });
+    await registerReferralIfNeeded(env, user, startParam, config);
   }
 
   // دعم حالة المستخدم الموجود مسبقًا: لو استوفى الشروط بالفعل،
   // فعّل الإحالة الجديدة فور تسجيلها.
-  // [SPEED] مفيش حاجة تتفعّل لو المستخدم ملوش مُحيل — كان بيقرا users/{id} تاني ويكتب سجل debug
-  // في *كل* طلب (حتى الـ heartbeat) عشان يطلع بنتيجة "no_referrer".
-  if (user.forceSubPassed && user.referredBy) {
-    await activateReferralIfNeeded(env, user.telegramId, config, botToken, user);
+  if (user.forceSubPassed) {
+    await activateReferralIfNeeded(env, user.telegramId, config, botToken);
   }
 
   return user;
@@ -1221,19 +1133,21 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
   // Firebase تحت debug_referral_attempts/<telegramId> هل الكود
   // وصل من الأساس، وهل لقى المُحيل ولا لأ، من غير ما تحتاج تفحص
   // الكود أو تسأل المستخدم أسئلة كتير كل مرة.
-  // [SPEED] سجل الـ debug ده مش لازم الطلب يستنّاه — بيتكتب في الخلفية (الأخطاء بتتبلع زي الأول).
-  const logAttempt = (extra) => {
-    dbSet(env, `debug_referral_attempts/${telegramId}`, {
-      startParamReceived: startParam || null,
-      alreadyHadReferrer: !!user.referredBy,
-      ts: Date.now(),
-      ...extra,
-    }).catch(() => {});
+  const logAttempt = async (extra) => {
+    try {
+      await dbSet(env, `debug_referral_attempts/${telegramId}`, {
+        startParamReceived: startParam || null,
+        alreadyHadReferrer: !!user.referredBy,
+        ts: Date.now(),
+        ...extra,
+      });
+    } catch (_) {}
   };
 
-  // مفيش start_param = مفيش حاجة تتشخّص. (قبل كده كان بيكتب 'no_start_param' في كل طلب
-  // وبيمسح سجل التشخيص المفيد اللي اتكتب قبله.)
-  if (!startParam) return;
+  if (!startParam) {
+    await logAttempt({ result: 'no_start_param' });
+    return;
+  }
   if (user.referredBy) {
     await logAttempt({ result: 'already_has_referrer', existingReferrer: user.referredBy });
     return;
@@ -1304,50 +1218,50 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
 // "not found" result can be told apart from a lookup that actually failed
 // (which used to be silently swallowed and looked identical to a genuine
 // miss in the debug logs — making real outages impossible to diagnose).
-// [FIX 2] الدالة دي كانت بتنزّل جدول users كله كـ fallback كل ما الاستعلام
-// المفهرس مالقاش نتيجة — وده بيحصل مع *كل مستخدم جديد* (لأن generateUniqueReferralCode
-// بيدوّر على كود لسه ما اتاخدش) ومع أي كود إحالة غلط. دلوقتي الاعتماد بالكامل على
-// فهرس Firebase. لازم تضيف في Firebase Rules:
-//     "users": { ".indexOn": ["referralCode"] }
-// ولو الفهرس مش موجود الاستعلام هيفشل (source: 'indexed_query_failed') وهيظهر تحذير
-// واضح في اللوج بدل ما السيرفر يحمّل الجدول كله ويقع.
-let lastReferralIndexWarnAt = 0;
 async function findUserByReferralCode(env, code) {
   const base = env.FIREBASE_DATABASE_URL.replace(/\/$/, '');
-  const raw = String(code ?? '').trim();
-  // الأكواد بتتولّد UPPERCASE، فنجرّب الكود زي ما هو ثم النسخة الكبيرة (لو مختلفة).
-  const candidates = [...new Set([raw, raw.toUpperCase()])].filter(Boolean);
+  const url = `${base}/users.json?orderBy=${encodeURIComponent('"referralCode"')}&equalTo=${encodeURIComponent('"' + code + '"')}`;
   let indexedQueryFailed = false;
   let indexedQueryError = null;
 
-  for (const candidate of candidates) {
-    const url = `${base}/users.json?orderBy=${encodeURIComponent('"referralCode"')}` +
-      `&equalTo=${encodeURIComponent(JSON.stringify(candidate))}&limitToFirst=1`;
-    try {
-      const res = await fbFetch(url, {}, 'users?orderBy=referralCode');
+  try {
+    const res = await fetch(url);
+    if (res.ok) {
       const result = await res.json();
       if (result) {
         const key = Object.keys(result)[0];
         if (key) return { user: result[key], source: 'indexed' };
       }
-    } catch (err) {
+    } else {
       indexedQueryFailed = true;
-      indexedQueryError = String((err && err.message) || err);
-      break; // مفيش فايدة من المحاولة تاني — غالبًا الفهرس ناقص أو Firebase واقع
+      indexedQueryError = `HTTP ${res.status}`;
     }
+  } catch (err) {
+    indexedQueryFailed = true;
+    indexedQueryError = String(err && err.message || err);
   }
 
-  if (indexedQueryFailed && Date.now() - lastReferralIndexWarnAt > 60_000) {
-    lastReferralIndexWarnAt = Date.now();
-    console.error('❌ Referral lookup failed (' + indexedQueryError + '). Make sure Firebase rules contain: "users": { ".indexOn": ["referralCode"] }');
+  // Fallback in case Firebase rules or a missing index blocked the filtered
+  // query above. The user count is normally small enough that scanning the
+  // whole table server-side is fine, and this comparison is case-insensitive
+  // so a code copied in a different case still matches.
+  try {
+    const allUsers = await dbGet(env, 'users');
+    if (!allUsers) return { user: null, source: 'fallback_no_users', indexedQueryFailed, indexedQueryError };
+    const wanted = String(code).trim().toUpperCase();
+    const match = Object.values(allUsers).find((u) =>
+      String(u?.referralCode || '').trim().toUpperCase() === wanted
+    );
+    return { user: match || null, source: 'fallback', indexedQueryFailed, indexedQueryError };
+  } catch (err) {
+    return {
+      user: null,
+      source: 'fallback_error',
+      indexedQueryFailed,
+      indexedQueryError,
+      fallbackError: String(err && err.message || err),
+    };
   }
-
-  return {
-    user: null,
-    source: indexedQueryFailed ? 'indexed_query_failed' : 'indexed_not_found',
-    indexedQueryFailed,
-    indexedQueryError,
-  };
 }
 
 // ───────── إعدادات كل شركة إعلانات على حدة ─────────
@@ -1536,30 +1450,28 @@ async function addBalanceLog(env, telegramId, logEntry) {
 async function sendTelegramMessage(env, botToken, chatId, text) {
   if (!botToken || !chatId) return;
   try {
-    const tgRes = await fetchWithTimeout(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: String(chatId), text }),
-    }, 10_000);
-    try { await tgRes.body?.cancel(); } catch (_) {}
+    });
   } catch (_) {}
 }
 
 // مكافأة الإحالة: نظام يوم واحد فقط. بمجرد ما المُحال يشوف 10 إعلانات
 // (في أي يوم)، تُصرف مكافأة الإحالة للمُحيل مباشرة ومرة واحدة فقط —
 // لا يوجد أي تقسيم للمكافأة على عدة أيام بعد الآن.
-async function activateReferralIfNeeded(env, telegramId, config, botToken, knownUser = null) {
-  // [SPEED] سجل الـ debug بيتكتب في الخلفية، ومبنسجّلش النتايج اللي بتتكرر مع كل طلب ومفيهاش
-  // معلومة جديدة (already_claimed / no_user_or_no_referrer).
-  const logActivation = (extra) => {
-    if (extra && (extra.result === 'already_claimed' || extra.result === 'no_user_or_no_referrer')) return;
-    dbSet(env, `debug_referral_activation/${telegramId}`, {
-      ts: Date.now(),
-      ...extra,
-    }).catch(() => {});
+async function activateReferralIfNeeded(env, telegramId, config, botToken) {
+  const logActivation = async (extra) => {
+    try {
+      await dbSet(env, `debug_referral_activation/${telegramId}`, {
+        ts: Date.now(),
+        ...extra,
+      });
+    } catch (_) {}
   };
 
-  const user = knownUser || await dbGet(env, `users/${telegramId}`);
+  const user = await dbGet(env, `users/${telegramId}`);
   if (!user || !user.referredBy) {
     await logActivation({ result: 'no_user_or_no_referrer' });
     return;
@@ -1714,7 +1626,7 @@ async function checkTelegramMembership(env, chatLink, telegramId, botToken) {
 
   const url = `https://api.telegram.org/bot${botToken}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${telegramId}`;
   try {
-    const res = await fetchWithTimeout(url, {}, 10_000);
+    const res = await fetch(url);
     const result = await res.json();
     if (!result.ok || !result.result?.user) return false;
     if (String(result.result.user.id) !== String(telegramId)) return false;
@@ -1734,14 +1646,13 @@ async function checkBotAdminInChat(chatLink, botToken) {
     return { ok: false, error: 'Use a public Telegram channel link such as https://t.me/yourchannel.' };
   }
   try {
-    const meRes = await fetchWithTimeout(`https://api.telegram.org/bot${botToken}/getMe`, {}, 10_000);
+    const meRes = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
     const me = await meRes.json();
     if (!me.ok || !me.result?.id) {
       return { ok: false, error: 'Unable to verify the bot account.' };
     }
-    const memberRes = await fetchWithTimeout(
-      `https://api.telegram.org/bot${botToken}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${me.result.id}`,
-      {}, 10_000
+    const memberRes = await fetch(
+      `https://api.telegram.org/bot${botToken}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${me.result.id}`
     );
     const member = await memberRes.json();
     const status = member.ok ? member.result?.status : null;
@@ -1767,17 +1678,18 @@ async function checkUserForceSub(env, telegramId, botToken, config) {
     return { required: false, passed: true, channels: [] };
   }
 
-  // [SPEED] فحص العضوية في كل القنوات بالتوازي (كان قناة ورا قناة، وكل واحدة نداء لـ Telegram).
-  const joinedFlags = await Promise.all(
-    channels.map((ch) => checkTelegramMembership(env, ch.link, telegramId, botToken))
-  );
-  const results = channels.map((ch, i) => ({
-    id: ch.id,
-    title: ch.title || ch.username || extractChatIdentifier(ch.link) || ch.link,
-    link: ch.link,
-    joined: joinedFlags[i],
-  }));
-  const allJoined = joinedFlags.every(Boolean);
+  const results = [];
+  let allJoined = true;
+  for (const ch of channels) {
+    const joined = await checkTelegramMembership(env, ch.link, telegramId, botToken);
+    if (!joined) allJoined = false;
+    results.push({
+      id: ch.id,
+      title: ch.title || ch.username || extractChatIdentifier(ch.link) || ch.link,
+      link: ch.link,
+      joined,
+    });
+  }
   return { required: true, passed: allJoined, channels: results };
 }
 
@@ -1816,37 +1728,29 @@ async function handleGetState(env, ctx) {
   // اقرأ المستخدم مرة أخرى عند فتح الصفحة. ctx.user تم تحميله قبل بعض
   // عمليات التهيئة، وقد يكون أقدم من القيمة الموجودة فعليًا في Firebase
   // (خصوصًا بعد مشاهدة إعلان من جلسة أخرى).
-  // [SPEED] كل القراءات المستقلة (المستخدم + الجداول + فحص الاشتراك الإجباري + قائمة المحظورين)
-  // بتتنفذ في دفعة واحدة بالتوازي بدل 3 مراحل ورا بعض. المسارات بتستخدم ctx.user.telegramId
-  // (نفس الـ ID) لأن الـ user الطازج لسه بيتقرا في نفس الدفعة.
-  const uid = ctx.user.telegramId;
-  const [freshUser, tasksRaw, completedRaw, referralsRaw, logsRaw, withdrawalsRaw, gamePlaysRaw, fsStatus, blockedIds] = await Promise.all([
-    dbGet(env, `users/${uid}`).catch(() => ctx.user),
-    dbGet(env, 'tasks'),
-    dbGet(env, `users/${uid}/completedTasks`),
-    dbGet(env, `referrals/${uid}`),
-    dbGet(env, `balanceLogs/${uid}`),
-    dbGet(env, `withdrawals/${uid}`),
-    dbGet(env, `gamePlays/${uid}/${todayKeyCairo()}`),
-    // ───── إعادة التحقق الفعلي (Live) من الاشتراك الإجباري في كل مرة يفتح
-    // فيها المستخدم الويب أب — وليس فقط أول مرة. لو ترك القنوات بعد أن كان
-    // قد اشترك سابقًا، يُعاد قفل الواجهة حتى يرجع ويشترك من جديد ─────
-    checkUserForceSub(env, uid, botToken, config),
-    getBlockedAccountIds(env), // Set أو null لو الطلب فشل
-  ]);
-  // اقرأ المستخدم مرة أخرى عند فتح الصفحة. ctx.user ممكن يكون أقدم من القيمة الفعلية في Firebase.
-  const user = freshUser || ctx.user;
+  const user = await dbGet(env, `users/${ctx.user.telegramId}`).catch(() => ctx.user);
   const telegramId = user.telegramId;
 
+  const [tasksRaw, completedRaw, referralsRaw, logsRaw, withdrawalsRaw, gamePlaysRaw] = await Promise.all([
+    dbGet(env, 'tasks'),
+    dbGet(env, `users/${telegramId}/completedTasks`),
+    dbGet(env, `referrals/${telegramId}`),
+    dbGet(env, `balanceLogs/${telegramId}`),
+    dbGet(env, `withdrawals/${telegramId}`),
+    dbGet(env, `gamePlays/${telegramId}/${todayKeyCairo()}`),
+  ]);
+
+  // ───── إعادة التحقق الفعلي (Live) من الاشتراك الإجباري في كل مرة يفتح
+  // فيها المستخدم الويب أب — وليس فقط أول مرة. لو ترك القنوات بعد أن كان
+  // قد اشترك سابقًا، يُعاد قفل الواجهة حتى يرجع ويشترك من جديد ─────
+  const fsStatus = await checkUserForceSub(env, telegramId, botToken, config);
   if (fsStatus.passed !== !!user.forceSubPassed) {
     await dbUpdate(env, `users/${telegramId}`, { forceSubPassed: fsStatus.passed });
     user.forceSubPassed = fsStatus.passed;
   }
-  // تفعيل الإحالة (لو المستخدم ليه مُحيل بس) بيشتغل بالتوازي مع تجهيز قائمة الإحالات تحت.
-  const activationPromise = (fsStatus.passed && user.referredBy)
-    ? activateReferralIfNeeded(env, telegramId, config, botToken, user)
-    : null;
-  if (activationPromise) activationPromise.catch(() => {}); // منع unhandled rejection؛ الخطأ نفسه بيتعاد رميه عند await تحت
+  if (fsStatus.passed) {
+    await activateReferralIfNeeded(env, telegramId, config, botToken);
+  }
 
   const tasks = tasksRaw
     ? Object.entries(tasksRaw).map(([id, t]) => ({ id, ...t })).filter((t) => t.status === 'active' && t.category !== 'invite')
@@ -1859,88 +1763,50 @@ async function handleGetState(env, ctx) {
   // نظام الـ3 أيام السابق ممكن يكون عندها status = 'active' لو كانت
   // لسه مادفعتش كل الأيام — دي بتتعامل هنا كـ 'completed' لأن مكافأتها
   // اتصرفت بالفعل (جزئيًا على الأقل) تحت المنطق القديم.
-  // [FIX 6] قبل كده: لكل إحالة 3 طلبات Firebase بدون حد (users + blocked_accounts +
-  // balanceLogs الكاملة للمُحال) — مستخدم عنده 300 إحالة = 900 اتصال + تنزيل كل logs
-  // الناس دي. دلوقتي:
-  //   • balanceLogs المُحالين ما بتتحمّلش خالص (الـ commission بيتحسب من logs المستخدم نفسه
-  //     اللي متحمّلة أصلًا فوق).
-  //   • القائمة المعروضة مقتصرة على أحدث STATE_REFERRALS_LIMIT إحالة، وبتتجاب بتوازي محدود (10).
-  //   • الإحصائيات (total/active/inactive/multipleAccounts/commission) بتتحسب على *كل*
-  //     الإحالات مش على الصفحة المعروضة بس، وقائمة المحظورين بتتجاب بطلب shallow واحد.
-  const STATE_REFERRALS_LIMIT = 100;
-  const referralEntries = referralsRaw
-    ? Object.entries(referralsRaw).filter(([, r]) => r && typeof r === 'object')
+  const referrals = referralsRaw
+    ? await Promise.all(Object.entries(referralsRaw).map(async ([id, r]) => {
+        const [referredUser, blocked, referredLogs] = await Promise.all([
+          dbGet(env, `users/${id}`).catch(() => null),
+          dbGet(env, `blocked_accounts/${id}`).catch(() => null),
+          dbGet(env, `balanceLogs/${id}`).catch(() => null),
+        ]);
+        const adsWatched = Number(referredUser?.totalAdsWatched || 0);
+        const logs = referredLogs ? Object.values(referredLogs) : [];
+        const totalEarned = logs
+          .filter((l) => Number(l.amount || 0) > 0 && l.type !== 'referral_commission')
+          .reduce((sum, l) => sum + Number(l.amount || 0), 0);
+        const referrerEarned = logsRaw
+          ? Object.values(logsRaw)
+              .filter((l) => l.type === 'referral_commission' && String(l.relatedUser) === String(id))
+              .reduce((sum, l) => sum + Number(l.amount || 0), 0)
+          : 0;
+        const status = (r.status === 'active' || r.status === 'completed') ? 'completed' : 'pending';
+        // مكافأة الإحالة تُصرف مرة واحدة فقط — إما اتصرفت بالكامل
+        // (completed) أو لسه (pending) وبالتالي = 0.
+        const referralRewardEarned = status === 'completed'
+          ? Number(r.rewardPaid ?? r.reward ?? 0)
+          : 0;
+        const fraudMultipleAccounts = !!blocked;
+        return {
+          id,
+          ...r,
+          firstName: referredUser?.firstName || r.firstName || '',
+          lastName: referredUser?.lastName || '',
+          username: referredUser?.username || r.username || '',
+          photoUrl: referredUser?.photoUrl || r.photoUrl || '',
+          status,
+          adsWatched,
+          adsRequired: 10,
+          adsRemaining: Math.max(0, 10 - adsWatched),
+          totalEarned,
+          referrerEarned,
+          referralRewardEarned,
+          totalReferralEarned: referralRewardEarned + referrerEarned,
+          fraudMultipleAccounts,
+          fraudReason: blocked?.reason || '',
+        };
+      }))
     : [];
-  const referralsTotal = referralEntries.length;
-  const isDoneReferral = (r) => r.status === 'active' || r.status === 'completed';
-  const activeReferralsCount = referralEntries.filter(([, r]) => isDoneReferral(r)).length;
-
-  // عمولة الإحالة لكل مُحال — بتتحسب مرة واحدة من logs المستخدم (بدل O(إحالات × logs)).
-  const commissionByReferred = {};
-  if (logsRaw) {
-    for (const l of Object.values(logsRaw)) {
-      if (l && l.type === 'referral_commission') {
-        const k = String(l.relatedUser);
-        commissionByReferred[k] = (commissionByReferred[k] || 0) + Number(l.amount || 0);
-      }
-    }
-  }
-
-  const pageEntries = [...referralEntries]
-    .sort((a, b) => Number(b[1].joinedAt || 0) - Number(a[1].joinedAt || 0))
-    .slice(0, STATE_REFERRALS_LIMIT);
-
-  const referrals = await mapWithConcurrency(pageEntries, 25, async ([id, r]) => {
-    const inBlockedSet = blockedIds ? blockedIds.has(String(id)) : null;
-    const [referredUser, blocked] = await Promise.all([
-      dbGet(env, `users/${id}`).catch(() => null),
-      // لو عندنا قائمة المحظورين بنجيب السجل بس للمحظور فعلًا؛ لو مش عندنا بنجيبه للكل.
-      inBlockedSet === false ? null : dbGet(env, `blocked_accounts/${id}`).catch(() => null),
-    ]);
-    const adsWatched = Number(referredUser?.totalAdsWatched || 0);
-    const referrerEarned = commissionByReferred[String(id)] || 0;
-    const status = (r.status === 'active' || r.status === 'completed') ? 'completed' : 'pending';
-    // مكافأة الإحالة تُصرف مرة واحدة فقط — إما اتصرفت بالكامل
-    // (completed) أو لسه (pending) وبالتالي = 0.
-    const referralRewardEarned = status === 'completed'
-      ? Number(r.rewardPaid ?? r.reward ?? 0)
-      : 0;
-    const fraudMultipleAccounts = !!blocked || inBlockedSet === true;
-    return {
-      id,
-      ...r,
-      firstName: referredUser?.firstName || r.firstName || '',
-      lastName: referredUser?.lastName || '',
-      username: referredUser?.username || r.username || '',
-      photoUrl: referredUser?.photoUrl || r.photoUrl || '',
-      status,
-      adsWatched,
-      adsRequired: 10,
-      adsRemaining: Math.max(0, 10 - adsWatched),
-      // لم يعد يُحسب من balanceLogs المُحال (كان بيحمّلها كاملة). لو الواجهة بتعرضه،
-      // خزّن عدّاد totalEarned على سجل المستخدم وقت إضافة الرصيد، وإلا هيظهر 0.
-      totalEarned: Number(referredUser?.totalEarned || 0),
-      referrerEarned,
-      referralRewardEarned,
-      totalReferralEarned: referralRewardEarned + referrerEarned,
-      fraudMultipleAccounts,
-      fraudReason: blocked?.reason || '',
-    };
-  });
-
-  if (activationPromise) await activationPromise;
-
-  // إحصائيات كل الإحالات (مش بس الصفحة المعروضة)
-  const fraudIdSet = blockedIds || new Set(referrals.filter((r) => r.fraudMultipleAccounts).map((r) => String(r.id)));
-  let multipleAccountsCount = 0;
-  let inactiveReferralsCount = 0;
-  let commissionEarnedTotal = 0;
-  for (const [id, r] of referralEntries) {
-    const isFraud = fraudIdSet.has(String(id));
-    if (isFraud) multipleAccountsCount += 1;
-    if (!isDoneReferral(r) && !isFraud) inactiveReferralsCount += 1;
-    commissionEarnedTotal += commissionByReferred[String(id)] || 0;
-  }
 
   const balanceLogs = logsRaw
     ? Object.entries(logsRaw).map(([id, l]) => ({ id, ...l })).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 30)
@@ -1974,6 +1840,7 @@ async function handleGetState(env, ctx) {
   delete clientConfig.botToken;
   delete clientConfig.turnstileSecretKey;
 
+   const activeReferralsCount = referrals.filter((r) => (r.status === 'active' || r.status === 'completed')).length;
   const wheelSpinsUsed = user.wheelSpinsUsed || 0;
   const wheelSpinsAvailable = computeSpinsAvailable(activeReferralsCount, wheelSpinsUsed);
 
@@ -1983,8 +1850,6 @@ async function handleGetState(env, ctx) {
     tasks,
     completedTasks,
     referrals,
-    referralsTotal,                       // العدد الكلي للإحالات (القائمة أعلاه مقتصرة على الأحدث)
-    referralsLimit: STATE_REFERRALS_LIMIT,
     balanceLogs,
     withdrawals,
     config: clientConfig,
@@ -2011,16 +1876,16 @@ async function handleGetState(env, ctx) {
       adCompanyDailyLimit,
       adDailyTotalLimit: Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit),
       statsDate: today,
-      friendsInvited: referralsTotal,
+      friendsInvited: referrals.length,
       earnedToday,
     },
     gamePlays: gamePlaysRaw || {},
     referralStats: {
-      total: referralsTotal,
+      total: referrals.length,
       active: activeReferralsCount,
-      inactive: inactiveReferralsCount,
-      multipleAccounts: multipleAccountsCount,
-      commissionEarned: commissionEarnedTotal,
+     inactive: referrals.filter((r) => r.status !== 'completed' && !r.fraudMultipleAccounts).length,
+      multipleAccounts: referrals.filter((r) => r.fraudMultipleAccounts).length,
+      commissionEarned: referrals.reduce((sum, r) => sum + Number(r.referrerEarned || 0), 0),
     },
     forceSub: {
       required: fsStatus.required,
@@ -2032,45 +1897,6 @@ async function handleGetState(env, ctx) {
       })),
     },
   });
-}
-
-// تنفيذ دالة async على مصفوفة بحد أقصى `limit` عمليات متزامنة (بدل Promise.all المفتوح).
-async function mapWithConcurrency(items, limit, fn) {
-  const out = new Array(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (true) {
-      const idx = next++;
-      if (idx >= items.length) return;
-      out[idx] = await fn(items[idx], idx);
-    }
-  });
-  await Promise.all(workers);
-  return out;
-}
-
-// قائمة IDs الحسابات المحظورة بطلب shallow واحد (مفاتيح فقط، بدون تنزيل السجلات) + كاش 30 ثانية.
-const BLOCKED_IDS_CACHE_TTL_MS = 30_000;
-const blockedIdsCache = { set: null, at: 0, inflight: null };
-async function getBlockedAccountIds(env) {
-  if (blockedIdsCache.set && Date.now() - blockedIdsCache.at < BLOCKED_IDS_CACHE_TTL_MS) {
-    return blockedIdsCache.set;
-  }
-  if (!blockedIdsCache.inflight) {
-    blockedIdsCache.inflight = (async () => {
-      const res = await fbFetch(`${dbUrl(env, 'blocked_accounts')}?shallow=true`, {}, 'blocked_accounts?shallow');
-      const obj = await res.json();
-      const set = new Set(obj && typeof obj === 'object' ? Object.keys(obj) : []);
-      blockedIdsCache.set = set;
-      blockedIdsCache.at = Date.now();
-      return set;
-    })().finally(() => { blockedIdsCache.inflight = null; });
-  }
-  try {
-    return await blockedIdsCache.inflight;
-  } catch (_) {
-    return blockedIdsCache.set; // آخر نسخة ناجحة أو null
-  }
 }
 
 function todayKeyUTCFromTimestamp(ts) {
@@ -2873,12 +2699,11 @@ async function getOrInitWeeklyContestState(env, config) {
 // اللي دعوا مستخدم واحد على الأقل خلال الفترة، مرتبين تنازليًا حسب
 // العدد. عند تساوي العدد بين مستخدمين، يتم تفضيل من بدأ الدعوة أبكر
 // (أقدم إحالة له ضمن الفترة) كتقريب عملي لـ"مين وصل للرقم ده الأول".
-// [FIX 1] قبل كده الدالة دي كانت بتنزّل جدول users بالكامل (مع referrals) في كل استدعاء
-// عشان تجيب أسماء/صور الناس. دلوقتي بتنزّل referrals بس (لازم للعدّ)، وبعد الترتيب بتجيب
-// بيانات العرض لأعلى WEEKLY_PROFILE_TOP_N مستخدم فقط (الواجهة بتعرض 25 والجوايز 10).
-const WEEKLY_PROFILE_TOP_N = 25;
 async function computeWeeklyReferralLeaderboard(env, startTs, endTs) {
-  const allReferrals = await dbGet(env, 'referrals');
+  const [allReferrals, allUsers] = await Promise.all([
+    dbGet(env, 'referrals'),
+    dbGet(env, 'users'),
+  ]);
   const rows = [];
   if (allReferrals) {
     for (const [referrerId, refs] of Object.entries(allReferrals)) {
@@ -2898,7 +2723,15 @@ async function computeWeeklyReferralLeaderboard(env, startTs, endTs) {
         }
       }
       if (count > 0) {
-        rows.push({ telegramId: referrerId, firstName: '', username: '', photoUrl: '', count, earliestTs });
+        const u = (allUsers && allUsers[referrerId]) || {};
+        rows.push({
+          telegramId: referrerId,
+          firstName: u.firstName || '',
+          username: u.username || '',
+          photoUrl: u.photoUrl || '',
+          count,
+          earliestTs,
+        });
       }
     }
   }
@@ -2907,45 +2740,7 @@ async function computeWeeklyReferralLeaderboard(env, startTs, endTs) {
     if (a.earliestTs !== b.earliestTs) return a.earliestTs - b.earliestTs;
     return String(a.telegramId).localeCompare(String(b.telegramId));
   });
-
-  await Promise.all(rows.slice(0, WEEKLY_PROFILE_TOP_N).map(async (row) => {
-    try {
-      const u = await dbGet(env, `users/${row.telegramId}`);
-      if (u) {
-        row.firstName = u.firstName || '';
-        row.username = u.username || '';
-        row.photoUrl = u.photoUrl || '';
-      }
-    } catch (_) {}
-  }));
   return rows;
-}
-
-// [FIX 1] كاش لمدة 60 ثانية للتصنيف (مع دمج الطلبات المتزامنة في طلب واحد). بيتستخدم
-// فقط في endpoint العرض — توزيع الجوائز بيحسب التصنيف مباشرة بدون كاش لضمان الدقة.
-const LEADERBOARD_CACHE_TTL_MS = 60_000;
-const leaderboardCache = { key: '', data: null, at: 0, inflight: null, inflightKey: '' };
-async function getWeeklyLeaderboardCached(env, startTs, endTs) {
-  const key = `${startTs}-${endTs}`;
-  if (leaderboardCache.data && leaderboardCache.key === key && Date.now() - leaderboardCache.at < LEADERBOARD_CACHE_TTL_MS) {
-    return leaderboardCache.data;
-  }
-  if (leaderboardCache.inflight && leaderboardCache.inflightKey === key) {
-    return leaderboardCache.inflight;
-  }
-  const p = computeWeeklyReferralLeaderboard(env, startTs, endTs)
-    .then((data) => {
-      leaderboardCache.key = key;
-      leaderboardCache.data = data;
-      leaderboardCache.at = Date.now();
-      return data;
-    })
-    .finally(() => {
-      if (leaderboardCache.inflight === p) leaderboardCache.inflight = null;
-    });
-  leaderboardCache.inflight = p;
-  leaderboardCache.inflightKey = key;
-  return p;
 }
 
 // يوزّع جوائز أسبوع منتهى (لو مش اتوزعت قبل كده) ثم يبدأ فترة جديدة
@@ -3047,7 +2842,7 @@ async function ensureWeeklyContestUpToDate(env, config) {
 async function handleGetWeeklyLeaderboard(env, ctx) {
   const { user, config } = ctx;
   const state = await ensureWeeklyContestUpToDate(env, config);
-  const leaderboard = await getWeeklyLeaderboardCached(env, state.startTs, state.endTs);
+  const leaderboard = await computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs);
   const prizes = weeklyContestPrizes(config);
 
   const TOP_LIMIT = 25;
@@ -3263,10 +3058,9 @@ async function handleVerifyDeposit(env, ctx) {
   }
   if (!env.TONCENTER_API_KEY) return fail('TONCENTER_API_KEY missing', 500);
 
-  const response = await fetchWithTimeout(
+  const response = await fetch(
     `https://toncenter.com/api/v2/getTransactions?address=${DEPOSIT_RECEIVER_WALLET}&limit=20`,
     { headers: { 'X-API-Key': env.TONCENTER_API_KEY } },
-    10_000,
   );
   if (!response.ok) return fail('Unable to verify transaction, try later', 502);
   const data = await response.json();
@@ -3444,31 +3238,25 @@ async function handleFetch(request, env) {
       const startParam = /^[A-Za-z0-9_-]{1,128}$/.test(String(rawStartParam))
         ? String(rawStartParam)
         : null;
-      // [SPEED] قراءة حالة الحظر مستقلة عن getOrCreateUser فبنشغّلهم مع بعض بدل ورا بعض.
-      const [user, accountBlocked] = await Promise.all([
-        getOrCreateUser(env, verification.user, startParam, config, botToken),
-        dbGet(env, `blocked_accounts/${String(verification.user.id)}`).catch(() => null),
-      ]);
+      const user = await getOrCreateUser(env, verification.user, startParam, config, botToken);
 
       // ── حظر الحساب من لوحة التحكم أو نظام مكافحة الاحتيال ──────────
       // أي حساب موجود تحت blocked_accounts/{telegramId} يُمنع فورًا من
       // استخدام أي إندبوينت في الـ API، مش بس مكافآت الإحالة.
-      if (accountBlocked) {
-        let linkedAccounts = [];
-        try {
-          linkedAccounts = await afGetLinkedAccounts(env, accountBlocked.fingerprint, accountBlocked.deviceId, user.telegramId);
-        } catch (_) {}
-        return failBlocked(accountBlocked.reason, accountBlocked.reasonCode, linkedAccounts);
-      }
+      try {
+        const accountBlocked = await dbGet(env, `blocked_accounts/${user.telegramId}`);
+        if (accountBlocked) {
+          let linkedAccounts = [];
+          try {
+            linkedAccounts = await afGetLinkedAccounts(env, accountBlocked.fingerprint, accountBlocked.deviceId, user.telegramId);
+          } catch (_) {}
+          return failBlocked(accountBlocked.reason, accountBlocked.reasonCode, linkedAccounts);
+        }
+      } catch (_) {}
       // ─────────────────────────────────────────────────────────────
 
       // ── طبقة الحماية ضد الاحتيال (تعدد الحسابات عبر بصمة الجهاز) ──
-      // [SPEED] الـ heartbeat (كل 25 ثانية لكل مستخدم) بيكتب lastActiveAt بس، فمش محتاج يعدّي
-      // على فحص الجهاز الكامل (عشرات القراءات/الكتابات). أي طلب تاني (getState وغيره)
-      // بيعمل الفحص كامل، فأي تعدد حسابات بيتكشف عند أول تفاعل فعلي.
-      const fraudResult = (path === '/heartbeat')
-        ? { blocked: false, referralBlocked: false, score: 0 }
-        : await checkAntiFraud(env, request, user.telegramId, body, { skipBlockedCheck: true });
+      const fraudResult = await checkAntiFraud(env, request, user.telegramId, body);
       if (fraudResult.blocked) {
         return failBlocked(fraudResult.reason, fraudResult.reasonCode, fraudResult.linkedAccounts);
       }
@@ -3538,7 +3326,7 @@ const server = http.createServer(async (req, res) => {
 // وعلى 0.0.0.0 مش على localhost فقط.
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Server is running on port ${PORT} (Node ${process.version})`);
+  console.log(`✅ Server is running on port ${PORT}`);
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -3566,28 +3354,3 @@ setInterval(async () => {
     weeklyContestTickRunning = false;
   }
 }, WEEKLY_CONTEST_CHECK_INTERVAL_MS);
-
-
-// ════════════════════════════════════════════════════════════════════
-//  [FIX 7] تنظيف دوري للذاكرة كل دقيقة:
-//   • rateLimitStore: كان بيحتفظ بكل IP للأبد — دلوقتي بنشيل أي IP ما اتكلمش
-//     خلال نافذة الـ rate limit.
-//   • usedInitDataHashes / adNonceStore: بنشيل المنتهي منهم.
-//  + سطر لوج واحد كل دقيقة بيوضح استهلاك الذاكرة (RSS) وأحجام الـ Maps — عشان تتأكد
-//  من الرسم البياني في Railway إن الرام مش بتزيد. شيله لو مش عايزه.
-// ════════════════════════════════════════════════════════════════════
-setInterval(() => {
-  try {
-    const now = Date.now();
-    for (const [key, arr] of rateLimitStore) {
-      if (!arr.length || now - arr[arr.length - 1] > RATE_LIMIT_WINDOW_MS) rateLimitStore.delete(key);
-    }
-    cleanupExpiredHashes();
-    cleanupExpiredAdNonces();
-    const mb = (n) => Math.round(n / 1048576);
-    const m = process.memoryUsage();
-    console.log(`[mem] rss=${mb(m.rss)}MB heap=${mb(m.heapUsed)}MB rateLimit=${rateLimitStore.size} hashes=${usedInitDataHashes.size} adTickets=${adNonceStore.size}`);
-  } catch (err) {
-    console.error('⚠️ cleanup tick failed:', err && err.message);
-  }
-}, 60 * 1000);
