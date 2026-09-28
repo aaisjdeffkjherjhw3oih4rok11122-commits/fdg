@@ -2088,6 +2088,9 @@ async function handleClaimAdReward(env, ctx) {
       totalAdsWatched: Number(freshUser?.totalAdsWatched || 0) + 1,
     });
     await addBalanceLog(env, user.telegramId, { type: 'ad_reward', amount: reward, date: today, ts: Date.now() });
+    // مسابقة الإعلانات: تسجيل المشاهدة (بتوقيت السيرفر) ضمن الجولة الحالية.
+    // فشل التسجيل ما يكسرش صرف المكافأة.
+    try { await recordAdsContestView(env, config, user.telegramId); } catch (e) { console.error('⚠️ Ads contest record failed:', e.message); }
     if (watched + 1 >= 10) {
       await activateReferralIfNeeded(env, user.telegramId, config);
     }
@@ -2749,6 +2752,152 @@ async function handleGetWeeklyLeaderboard(env, ctx) {
   });
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  مسابقة الإعلانات (Ads Leaderboard) — مستقلة عن مسابقة الإحالات
+//  نفس المدة/الجوائز/عدد المراكز (من نفس إعدادات weeklyContest*).
+//  البنية في Firebase:
+//   adsContest/state                      -> { periodId, startTs, endTs }
+//   adsContest/counts/{periodId}/{tid}    -> { count, firstTs, lastTs }
+//   adsContest/history/{periodId}         -> قفل + نتائج التوزيع
+//  العدّ بيحصل في السيرفر فقط داخل /syncBalance (بعد التحقق من التذكرة
+//  والكابتشا وحدود اليوم) بتوقيت السيرفر، فالواجهة مالهاش أي دخل في الرقم.
+//  أي إعلان قبل بداية الجولة بيتسجل في جولة سابقة ومش بيدخل هنا.
+// ════════════════════════════════════════════════════════════════════
+function makeAdsPeriodId(startTs) { return `ac_${startTs}`; }
+
+async function getOrInitAdsContestState(env, config) {
+  let state = await dbGet(env, 'adsContest/state');
+  if (!state || !state.startTs || !state.endTs) {
+    const startTs = Date.now();
+    state = { periodId: makeAdsPeriodId(startTs), startTs, endTs: startTs + weeklyContestDuration(config) };
+    await dbSet(env, 'adsContest/state', state);
+  }
+  return state;
+}
+
+async function computeAdsLeaderboard(env, periodId) {
+  const [counts, allUsers] = await Promise.all([
+    dbGet(env, `adsContest/counts/${periodId}`),
+    dbGet(env, 'users'),
+  ]);
+  const rows = [];
+  for (const [tid, c] of Object.entries(counts || {})) {
+    const count = Number(c?.count || 0);
+    if (count <= 0) continue;
+    const u = (allUsers && allUsers[tid]) || {};
+    rows.push({
+      telegramId: tid, firstName: u.firstName || '', username: u.username || '',
+      photoUrl: u.photoUrl || '', count, earliestTs: Number(c?.lastTs || 0),
+    });
+  }
+  // التعادل: اللي وصل للرقم أولًا (أقدم آخر مشاهدة) يتقدم
+  rows.sort((a, b) => (b.count - a.count) || (a.earliestTs - b.earliestTs) || String(a.telegramId).localeCompare(String(b.telegramId)));
+  return rows;
+}
+
+async function finalizeAndAdvanceAdsPeriod(env, config, state) {
+  const periodId = state.periodId || makeAdsPeriodId(state.startTs);
+  const historyPath = `adsContest/history/${periodId}`;
+  const existing = await dbGet(env, historyPath);
+  if (!existing || (!existing.distributed && !existing.distributing)) {
+    await dbSet(env, historyPath, { startTs: state.startTs, endTs: state.endTs, distributed: false, distributing: true, lockedAt: Date.now() });
+    const leaderboard = await computeAdsLeaderboard(env, periodId);
+    const prizes = weeklyContestPrizes(config);
+    const winners = [];
+    for (let i = 0; i < prizes.length; i++) {
+      const row = leaderboard[i];
+      const prizeTon = prizes[i];
+      if (!row || !(prizeTon > 0)) continue;
+      try {
+        const freshUser = await dbGet(env, `users/${row.telegramId}`);
+        const newTon = Number((Number(freshUser?.tonBalance || 0) + prizeTon).toFixed(6));
+        await dbUpdate(env, `users/${row.telegramId}`, { tonBalance: newTon });
+        await addBalanceLog(env, row.telegramId, {
+          type: 'ads_contest_prize', amount: prizeTon, currency: 'TON', rank: i + 1,
+          adsCount: row.count, periodId, ts: Date.now(),
+        });
+        await sendTelegramMessage(env, config.botToken || '', row.telegramId,
+          `📺 Ads Leaderboard results!\n\nYou finished #${i + 1} this round with ${row.count} ad${row.count === 1 ? '' : 's'} watched.\n\n💎 +${prizeTon} TON has been credited to your balance automatically.\n\n🔄 A new Ads round just started — keep watching to compete again!`);
+        winners.push({ rank: i + 1, telegramId: row.telegramId, firstName: row.firstName, username: row.username, count: row.count, prizeTon });
+      } catch (err) {
+        winners.push({ rank: i + 1, telegramId: row.telegramId, count: row.count, prizeTon, error: String(err && err.message || err) });
+      }
+    }
+    await dbSet(env, historyPath, {
+      startTs: state.startTs, endTs: state.endTs, distributed: true, distributing: false,
+      distributedAt: Date.now(), totalPrizeTon: winners.reduce((t, w) => t + (w.error ? 0 : w.prizeTon), 0), winners,
+    });
+  }
+  const nextStartTs = state.endTs;
+  const nextState = { periodId: makeAdsPeriodId(nextStartTs), startTs: nextStartTs, endTs: nextStartTs + weeklyContestDuration(config) };
+  await dbSet(env, 'adsContest/state', nextState);
+  return nextState;
+}
+
+async function ensureAdsContestUpToDate(env, config) {
+  let state = await getOrInitAdsContestState(env, config);
+  let guard = 0;
+  while (Date.now() >= state.endTs && guard < 60) {
+    state = await finalizeAndAdvanceAdsPeriod(env, config, state);
+    guard++;
+  }
+  return state;
+}
+
+// تسجيل مشاهدة إعلان واحدة في الجولة الحالية (بتوقيت السيرفر).
+async function recordAdsContestView(env, config, telegramId) {
+  const state = await ensureAdsContestUpToDate(env, config);
+  const now = Date.now();
+  if (now < state.startTs || now >= state.endTs) return;
+  const path = `adsContest/counts/${state.periodId}/${telegramId}`;
+  const cur = (await dbGet(env, path)) || {};
+  await dbSet(env, path, {
+    count: Number(cur.count || 0) + 1,
+    firstTs: Number(cur.firstTs || now),
+    lastTs: now,
+  });
+}
+
+// ───────────────────── POST /getCompetitionLeaderboard ─────────────────────
+// body.type: 'referral' | 'ads'. الرد بنفس شكل /getWeeklyLeaderboard + حقول موحّدة.
+const COMPETITION_TYPES = {
+  referral: {
+    label: 'Referral Leaderboard', scoreLabel: 'Active Referrals',
+    ensure: (env, config) => ensureWeeklyContestUpToDate(env, config),
+    compute: (env, state) => computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs),
+  },
+  ads: {
+    label: 'Ads Leaderboard', scoreLabel: 'Ads Watched',
+    ensure: (env, config) => ensureAdsContestUpToDate(env, config),
+    compute: (env, state) => computeAdsLeaderboard(env, state.periodId || makeAdsPeriodId(state.startTs)),
+  },
+};
+
+async function handleGetCompetitionLeaderboard(env, ctx) {
+  const { user, config, body } = ctx;
+  const type = String(body?.type || 'referral');
+  const comp = COMPETITION_TYPES[type];
+  if (!comp) return fail('Unknown competition type');
+  const state = await comp.ensure(env, config);
+  const leaderboard = await comp.compute(env, state);
+  const prizes = weeklyContestPrizes(config);
+  const TOP_LIMIT = 25;
+  const top = leaderboard.slice(0, TOP_LIMIT).map((row, i) => ({
+    rank: i + 1, telegramId: row.telegramId, firstName: row.firstName, username: row.username,
+    photoUrl: row.photoUrl, score: row.count, prizeTon: prizes[i] || 0,
+  }));
+  const myIndex = leaderboard.findIndex((r) => String(r.telegramId) === String(user.telegramId));
+  return ok({
+    competitionType: type, label: comp.label, scoreLabel: comp.scoreLabel,
+    roundStartTs: state.startTs, roundEndTs: state.endTs,
+    prizesTon: prizes, totalPrizePoolTon: Number(prizes.reduce((t, n) => t + n, 0).toFixed(4)),
+    leaderboard: top, topLimit: TOP_LIMIT,
+    myRank: myIndex >= 0 ? myIndex + 1 : null,
+    myScore: myIndex >= 0 ? leaderboard[myIndex].count : 0,
+    myPrizeTon: myIndex >= 0 ? (prizes[myIndex] || 0) : 0,
+  });
+}
+
 // ───────────────────────── POST /getReferrals ─────────────────────────
 async function handleGetReferrals(env, ctx) {
   const { user } = ctx;
@@ -3013,6 +3162,7 @@ const ROUTES = {
   '/spinWheel': handleSpinWheel,
   '/getReferrals': handleGetReferrals,
   '/getWeeklyLeaderboard': handleGetWeeklyLeaderboard,
+  '/getCompetitionLeaderboard': handleGetCompetitionLeaderboard,
   '/checkForceSub': handleCheckForceSub,
   '/requestWithdrawal': handleRequestWithdrawal,
   '/createDeposit': handleCreateDeposit,
@@ -3217,6 +3367,7 @@ setInterval(async () => {
   try {
     const config = await getConfig(process.env);
     await ensureWeeklyContestUpToDate(process.env, config);
+    await ensureAdsContestUpToDate(process.env, config);
   } catch (err) {
     console.error('⚠️ Weekly contest check failed:', err.message);
   } finally {
