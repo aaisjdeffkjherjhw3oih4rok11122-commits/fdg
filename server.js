@@ -109,7 +109,7 @@ const DEFAULT_CONFIG = {
   // مدة كل مسابقة أسبوعية بالمللي ثانية — الافتراضي 7 أيام بالظبط.
   // قابلة للتعديل من Firebase تحت config/weeklyContestDurationMs لو
   // حبيت تخليها مدة مختلفة (تجريبيًا مثلًا).
-  weeklyContestDurationMs: 7 * 24 * 60 * 60 * 1000,
+  weeklyContestDurationMs: 10 * 24 * 60 * 60 * 1000,
   // جوائز المراكز من 1 إلى 10 بعملة TON بالترتيب — مجموعها = 3 TON بالظبط
   // (1 + 0.5 + 0.5 + 0.25 + 0.25 + 0.1×5). قابلة للتعديل بالكامل من
   // Firebase تحت config/weeklyContestPrizesTon (لازم تفضل 10 عناصر بالظبط).
