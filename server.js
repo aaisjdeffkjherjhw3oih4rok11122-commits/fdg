@@ -295,9 +295,35 @@ function getValidFingerprint(value) {
 // بتتنادى على كل طلب — قراءة واحدة بس (blocks/{userId}). (نفس منطق
 // server-module.js: حظر مؤقت لو expiresAt لسه ما عدّاش، حظر دائم، وتنضيف
 // الحظر المنتهي تلقائيًا.)
+// مسار الحظر اليدوي من لوحة التحكم: blocked_accounts/{id} = { reason, score, ts }
+const MAG_MANUAL_BLOCKS_PATH = 'blocked_accounts';
+
+// ملحوظة: الدالة دي بقت fail-closed — لو قراءة Firebase فشلت بترمي الخطأ
+// (بدل ما ترجّع false وتسيب المحظور يعدّي). اللي بينادي عليها مسؤول عن
+// التعامل مع الخطأ (handleFetch بيرجّع 503).
 async function checkUserBlocked(env, userId) {
-  try {
-    const b = await dbGet(env, `${MAG_BLOCKS_PATH}/${userId}`);
+  {
+    // بنقرا المساريْن مع بعض: حظر النظام التلقائي (blocks/) + الحظر اليدوي
+    // من لوحة التحكم (blocked_accounts/). أي واحد منهم موجود = محظور.
+    const [b, manual] = await Promise.all([
+      dbGet(env, `${MAG_BLOCKS_PATH}/${userId}`),
+      dbGet(env, `${MAG_MANUAL_BLOCKS_PATH}/${userId}`),
+    ]);
+
+    if (manual) {
+      const reason = (manual && typeof manual === 'object' && manual.reason) || 'حظر يدوي من لوحة التحكم';
+      return {
+        isBlocked: true,
+        reason,
+        violation: 'MANUAL_BLOCK',
+        appliedAt: (manual && manual.ts) || null,
+        permanent: true,
+        details: reason,
+        blockType: 'PERMANENT_BLOCK',
+        deviceFingerprint: (b && b.deviceFingerprint) || null,
+      };
+    }
+
     if (!b) return false;
 
     if (b.expiresAt && b.expiresAt > Date.now()) {
@@ -341,9 +367,6 @@ async function checkUserBlocked(env, userId) {
       blockType: 'PERMANENT_BLOCK',
       deviceFingerprint: b.deviceFingerprint || null,
     };
-  } catch (error) {
-    console.error('Error checking user block:', error);
-    return false;
   }
 }
 
@@ -1753,9 +1776,10 @@ async function handleGetState(env, ctx) {
   // اتصرفت بالفعل (جزئيًا على الأقل) تحت المنطق القديم.
   const referrals = referralsRaw
     ? await Promise.all(Object.entries(referralsRaw).map(async ([id, r]) => {
-        const [referredUser, blocked, referredLogs] = await Promise.all([
+        const [referredUser, blockedAuto, blockedManual, referredLogs] = await Promise.all([
           dbGet(env, `users/${id}`).catch(() => null),
           dbGet(env, `${MAG_BLOCKS_PATH}/${id}`).catch(() => null),
+          dbGet(env, `${MAG_MANUAL_BLOCKS_PATH}/${id}`).catch(() => null),
           dbGet(env, `balanceLogs/${id}`).catch(() => null),
         ]);
         const adsWatched = Number(referredUser?.totalAdsWatched || 0);
@@ -1774,6 +1798,7 @@ async function handleGetState(env, ctx) {
         const referralRewardEarned = status === 'completed'
           ? Number(r.rewardPaid ?? r.reward ?? 0)
           : 0;
+        const blocked = blockedAuto || blockedManual;
         const fraudMultipleAccounts = !!blocked;
         return {
           id,
@@ -3387,22 +3412,38 @@ async function handleFetch(request, env) {
       const startParam = /^[A-Za-z0-9_-]{1,128}$/.test(String(rawStartParam))
         ? String(rawStartParam)
         : null;
-      const user = await getOrCreateUser(env, verification.user, startParam, config, botToken, body);
-
-      // ── حظر الحساب (نظام حماية تعدد الحسابات) ───────────────────────
-      // قراءة واحدة بس (blocks/{telegramId}) على كل طلب. المسح الكامل
-      // لجدول users بحثًا عن بصمة جهاز مكررة بقى بيحصل مرة واحدة بس عند
-      // إنشاء حساب جديد كليًا (جوه getOrCreateUser فوق)، مش هنا على كل
-      // طلب زي النظام القديم.
-      const blockCheck = await checkUserBlocked(env, user.telegramId);
+      // ── حظر الحساب ────────────────────────────────────────────────
+      // بيتفحص *قبل* getOrCreateUser عشان المحظور ما يتحدّثش له lastLogin
+      // ولا تتسجّل/تتفعّل له إحالات. بيقرا المساريْن: blocks/{id} (النظام
+      // التلقائي) و blocked_accounts/{id} (الحظر اليدوي من لوحة التحكم).
+      // لو القراءة فشلت بنرفض الطلب (fail-closed) بدل ما نسيبه يعدّي.
+      const tgIdStr = String(verification.user.id);
+      let blockCheck;
+      try {
+        blockCheck = await checkUserBlocked(env, tgIdStr);
+      } catch (blockErr) {
+        console.error('Block check failed (fail-closed):', blockErr);
+        return fail('Service temporarily unavailable, please try again.', 503);
+      }
       if (blockCheck && blockCheck.isBlocked) {
         let linkedAccounts = [];
         try {
-          linkedAccounts = await getSharedAccountsForDevice(env, blockCheck.deviceFingerprint, user.telegramId);
+          linkedAccounts = await getSharedAccountsForDevice(env, blockCheck.deviceFingerprint, tgIdStr);
         } catch (_) {}
         return failBlocked(blockCheck.reason, blockCheck.violation, linkedAccounts);
       }
       // ─────────────────────────────────────────────────────────────
+
+      const user = await getOrCreateUser(env, verification.user, startParam, config, botToken, body);
+
+      // حماية إضافية: الحساب اتحظر أثناء getOrCreateUser نفسه (مثلاً حساب
+      // جديد بصمته مكررة → guardNewAccountDevice حظره لتوّه). نفحص تاني.
+      if (user.isBlocked) {
+        const again = await checkUserBlocked(env, user.telegramId).catch(() => null);
+        if (again && again.isBlocked) {
+          return failBlocked(again.reason, again.violation, []);
+        }
+      }
 
       const ctx = { user, body, tgUser: verification.user, config, botToken, botUsername, ip };
       return await handler(env, ctx);
