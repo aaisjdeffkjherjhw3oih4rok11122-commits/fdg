@@ -285,16 +285,61 @@ function validateFingerprintFormat(fingerprint) {
   return { valid: true };
 }
 
-// بتتنادى على كل طلب — قراءة واحدة بس (blocks/{userId}).
+// بترجّع البصمة (lowercase) لو صيغتها SHA-256 سليمة، وإلا null.
+function getValidFingerprint(value) {
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  return validateFingerprintFormat(v).valid ? v : null;
+}
+
+// بتتنادى على كل طلب — قراءة واحدة بس (blocks/{userId}). (نفس منطق
+// server-module.js: حظر مؤقت لو expiresAt لسه ما عدّاش، حظر دائم، وتنضيف
+// الحظر المنتهي تلقائيًا.)
 async function checkUserBlocked(env, userId) {
   try {
-    const blockData = await dbGet(env, `${MAG_BLOCKS_PATH}/${userId}`);
-    if (!blockData) return false;
+    const b = await dbGet(env, `${MAG_BLOCKS_PATH}/${userId}`);
+    if (!b) return false;
+
+    if (b.expiresAt && b.expiresAt > Date.now()) {
+      return {
+        isBlocked: true,
+        reason: b.reason || 'Account blocked',
+        violation: b.violation || 'UNKNOWN',
+        appliedAt: b.appliedAt,
+        expiresAt: b.expiresAt,
+        permanent: !!b.permanent,
+        details: b.details || 'No details provided',
+        blockType: 'TEMPORARY_BLOCK',
+        deviceFingerprint: b.deviceFingerprint || null,
+      };
+    }
+    if (b.permanent) {
+      return {
+        isBlocked: true,
+        reason: b.reason || 'Permanently blocked',
+        violation: b.violation || 'UNKNOWN',
+        appliedAt: b.appliedAt,
+        permanent: true,
+        details: b.details || 'Account permanently blocked',
+        blockType: 'PERMANENT_BLOCK',
+        deviceFingerprint: b.deviceFingerprint || null,
+      };
+    }
+    if (b.expiresAt && b.expiresAt <= Date.now()) {
+      await dbDelete(env, `${MAG_BLOCKS_PATH}/${userId}`);
+      await dbUpdate(env, `${MAG_USERS_PATH}/${userId}`, { isBlocked: false, blockReason: null, blockedAt: null });
+      return false;
+    }
+    // سجل حظر قديم بدون permanent/expiresAt (النسخة السابقة كانت بتكتبه permanent)
     return {
       isBlocked: true,
-      reason: blockData.reason || 'Account blocked',
-      violation: blockData.violation || 'UNKNOWN',
-      deviceFingerprint: blockData.deviceFingerprint || null,
+      reason: b.reason || 'Account blocked',
+      violation: b.violation || 'UNKNOWN',
+      appliedAt: b.appliedAt,
+      permanent: true,
+      details: b.details || 'No details',
+      blockType: 'PERMANENT_BLOCK',
+      deviceFingerprint: b.deviceFingerprint || null,
     };
   } catch (error) {
     console.error('Error checking user block:', error);
@@ -309,10 +354,12 @@ async function applyBlock(env, userId, blockData) {
       reason: blockData.reason || 'System violation detected',
       violation: blockData.violation || 'UNKNOWN',
       appliedAt: Date.now(),
+      expiresAt: null,
       permanent: true,
       action: blockData.action || 'UNKNOWN',
       details: blockData.details || 'No details',
       deviceFingerprint: blockData.deviceFingerprint || 'Unknown',
+      isNewAccount: !!blockData.isNewAccount,
     };
     await dbSet(env, `${MAG_BLOCKS_PATH}/${userId}`, blockInfo);
     await dbUpdate(env, `${MAG_USERS_PATH}/${userId}`, {
@@ -320,6 +367,22 @@ async function applyBlock(env, userId, blockData) {
       blockReason: blockInfo.reason,
       blockedAt: Date.now(),
     });
+    // سجل عام للحظر (نادر الحدوث فمفيش حمل إضافي حقيقي)
+    try {
+      await dbPush(env, 'system/blocks', {
+        userId,
+        reason: blockInfo.reason,
+        violation: blockInfo.violation,
+        appliedAt: blockInfo.appliedAt,
+        permanent: true,
+        action: blockInfo.action,
+        details: blockInfo.details,
+        deviceFingerprint: blockInfo.deviceFingerprint,
+        isNewAccount: blockInfo.isNewAccount,
+      });
+    } catch (logErr) {
+      console.error('system/blocks log failed:', logErr);
+    }
     return true;
   } catch (error) {
     console.error('Error applying block:', error);
@@ -327,24 +390,70 @@ async function applyBlock(env, userId, blockData) {
   }
 }
 
-// المسح الكامل لجدول users بحثًا عن حساب تاني بنفس بصمة الجهاز. مكلفة
-// نسبيًا (بتقرا كل المستخدمين)، فبتتنادى مرة واحدة بس عند إنشاء حساب
-// جديد فعليًا (guardNewAccountDevice تحت)، أبدًا على طلب مستخدم موجود.
+// قلب النظام (نفس فكرة checkDeviceFingerprint في server-module.js):
+// بيمسح جدول users بحثًا عن أي حساب تاني بنفس بصمة الجهاز. الحساب "الأساسي"
+// هو الأقدم (createdAt) بين كل الحسابات على الجهاز *بما فيها الحساب الحالي*،
+// وكل حساب غيره بيتحظر (لو لسه ما اتحظرش). كده الحساب القديم عمره ما بيتحظر
+// بالغلط حتى لو اتفعّل عليه الفحص متأخر، وحالة السباق (حسابين في نفس اللحظة)
+// بتحظر الأحدث بس. مكلفة (بتقرا كل المستخدمين) فبتتنادى مرة واحدة لكل حساب:
+// عند إنشائه، أو عند أول طلب فيه بصمة سليمة لو اتعمل من غير بصمة.
 async function checkDeviceFingerprintMultiAccount(env, deviceFingerprint, currentUserId) {
   try {
-    if (!deviceFingerprint) return { deviceAlreadyUsed: false };
+    const fp = getValidFingerprint(deviceFingerprint);
+    if (!fp) return { deviceAlreadyUsed: false };
 
     const usersData = (await dbGet(env, MAG_USERS_PATH)) || {};
-    const existingAccounts = [];
+    const me = String(currentUserId);
+    const accounts = []; // كل الحسابات على الجهاز، شاملة الحالي
 
-    for (const [userId, userData] of Object.entries(usersData)) {
-      if (String(userId) === String(currentUserId)) continue;
-      if (userData.deviceFingerprint !== deviceFingerprint) continue;
-      existingAccounts.push({ userId, joinDate: userData.createdAt || null });
+    for (const [userId, u] of Object.entries(usersData)) {
+      if (!u || typeof u !== 'object') continue;
+      const isCurrent = String(userId) === me;
+      const theirFp = typeof u.deviceFingerprint === 'string' ? u.deviceFingerprint.toLowerCase() : '';
+      if (!isCurrent && theirFp !== fp) continue;
+      accounts.push({
+        userId: String(userId),
+        name: u.firstName || u.username || 'Anonymous User',
+        username: u.username || '',
+        photoUrl: u.photoUrl || '',
+        joinDate: Number(u.createdAt) || 0,
+        lastLogin: u.lastLogin || null,
+        isBlocked: !!u.isBlocked,
+        isCurrent,
+      });
     }
 
-    if (!existingAccounts.length) return { deviceAlreadyUsed: false };
-    return { deviceAlreadyUsed: true, existingAccounts };
+    const others = accounts.filter((a) => !a.isCurrent);
+    if (!others.length) return { deviceAlreadyUsed: false };
+
+    // الأقدم = الأساسي (التعادل بالـ userId عشان النتيجة تبقى ثابتة).
+    const primary = [...accounts].sort(
+      (a, b) => a.joinDate - b.joinDate || (a.userId < b.userId ? -1 : 1)
+    )[0];
+
+    let newAccountsBlocked = 0;
+    for (const acc of accounts) {
+      if (acc.userId === primary.userId || acc.isBlocked) continue;
+      await applyBlock(env, acc.userId, {
+        reason: acc.isCurrent
+          ? 'Device multi-account violation - New account detected'
+          : 'Device multi-account violation - Secondary account detected',
+        violation: 'DEVICE_MULTI_ACCOUNT',
+        action: 'deviceFingerprintCheck',
+        details: `Device fingerprint ${fp} already used by primary account ${primary.userId}`,
+        deviceFingerprint: fp,
+        isNewAccount: true,
+      });
+      newAccountsBlocked++;
+    }
+
+    return {
+      deviceAlreadyUsed: true,
+      existingAccounts: others,
+      primaryAccount: primary.userId,
+      currentIsPrimary: primary.userId === me,
+      newAccountsBlocked,
+    };
   } catch (error) {
     console.error('Error checking device fingerprint:', error);
     return { deviceAlreadyUsed: false };
@@ -352,21 +461,24 @@ async function checkDeviceFingerprintMultiAccount(env, deviceFingerprint, curren
 }
 
 // قائمة الحسابات المشتركة في نفس الجهاز — لعرضها في شاشة الحظر بالواجهة
-// فقط. بتتنادى مرة واحدة بس وقت ما نرجّع رد "محظور" فعليًا (نادر)، مش
-// على كل طلب عادي.
+// فقط. بتتنادى مرة واحدة بس وقت ما نرجّع رد "محظور" فعليًا (نادر).
 async function getSharedAccountsForDevice(env, deviceFingerprint, excludeUserId) {
-  if (!deviceFingerprint) return [];
+  if (!deviceFingerprint || deviceFingerprint === 'Unknown') return [];
+  const fp = String(deviceFingerprint).toLowerCase();
   try {
     const usersData = (await dbGet(env, MAG_USERS_PATH)) || {};
     const shared = [];
     for (const [uid, userData] of Object.entries(usersData)) {
-      if (String(uid) === String(excludeUserId)) continue;
-      if (userData.deviceFingerprint === deviceFingerprint) {
+      if (!userData || String(uid) === String(excludeUserId)) continue;
+      if (String(userData.deviceFingerprint || '').toLowerCase() === fp) {
         shared.push({
           telegramId: uid,
+          userId: uid,
           name: userData.firstName || userData.username || 'Unknown',
           username: userData.username || '',
           photoUrl: userData.photoUrl || '',
+          joinDate: userData.createdAt || null,
+          isBlocked: !!userData.isBlocked,
         });
       }
     }
@@ -377,27 +489,17 @@ async function getSharedAccountsForDevice(env, deviceFingerprint, excludeUserId)
   }
 }
 
-// بتتنادى مرة واحدة بس، جوه getOrCreateUser فورًا بعد إنشاء حساب جديد
-// كليًا. لو بصمة الجهاز دي مستخدمة قبل كده مع حساب تاني، الحساب الجديد
-// ده تحديدًا هو اللي بيتحظر (الحساب/الحسابات الأقدم على نفس الجهاز
-// بيفضلوا مستثنيين دايمًا لأنهم أصلاً مش هيدخلوا هنا تاني).
+// بتتنادى بعد إنشاء حساب جديد (أو أول ظهور لبصمة سليمة لحساب اتعمل من غير
+// بصمة). بتحظر كل الحسابات الثانوية على الجهاز؛ الأقدم بيفضل محمي.
 async function guardNewAccountDevice(env, userId, deviceFingerprint) {
-  if (!deviceFingerprint) return { blocked: false };
-  const formatCheck = validateFingerprintFormat(deviceFingerprint);
-  if (!formatCheck.valid) return { blocked: false };
-
-  const fingerprintCheck = await checkDeviceFingerprintMultiAccount(env, deviceFingerprint, userId);
-  if (!fingerprintCheck.deviceAlreadyUsed) return { blocked: false };
-
-  await applyBlock(env, userId, {
-    reason: 'Device multi-account violation - New account detected',
-    violation: 'DEVICE_MULTI_ACCOUNT',
-    action: 'initializeUser',
-    details: `Device fingerprint already used by ${fingerprintCheck.existingAccounts.length} other account(s)`,
-    deviceFingerprint,
-  });
-
-  return { blocked: true };
+  const fp = getValidFingerprint(deviceFingerprint);
+  if (!fp) {
+    console.warn(`guardNewAccountDevice: fingerprint for ${userId} is missing or not a 64-char SHA-256 hex — multi-account check skipped`);
+    return { blocked: false };
+  }
+  const check = await checkDeviceFingerprintMultiAccount(env, fp, userId);
+  if (!check.deviceAlreadyUsed) return { blocked: false };
+  return { blocked: !check.currentIsPrimary, primaryAccount: check.primaryAccount };
 }
 
 // بديل مبسّط لـ isReferralEligible القديمة: نفس فحص الحظر بالظبط (قراءة
@@ -913,7 +1015,10 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) 
     const referralCode = await generateUniqueReferralCode(env, telegramId);
     // بصمة الجهاز الجاية من الفرونت اند (device-fingerprint.client.js) —
     // بتتخزن كحقل واحد بس جوه المستخدم نفسه.
-    const deviceFingerprint = (body && typeof body._deviceFingerprint === 'string') ? body._deviceFingerprint : null;
+    const deviceFingerprint = getValidFingerprint(body && body._deviceFingerprint);
+    if (!deviceFingerprint) {
+      console.warn(`getOrCreateUser: new user ${telegramId} came without a valid device fingerprint (will be backfilled on a later request)`);
+    }
     const newUser = {
       telegramId,
       firstName: tgUser.first_name || '',
@@ -991,6 +1096,24 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) 
     }
     user.lastLogin = patch.lastLogin;
     await dbUpdate(env, userPath, patch);
+
+    // ── ترقيع البصمة: حساب اتعمل من غير بصمة (السكريبت اتأخر/اتحجب، أو حساب
+    // قديم قبل النظام ده) بياخد بصمته من أول طلب فيه بصمة سليمة، وبعدين
+    // بيتفحص مرة واحدة. الكتابة شرطية فمفيش سباق ولا استبدال لبصمة موجودة. ──
+    if (!user.deviceFingerprint && !user.isBlocked) {
+      const incomingFp = getValidFingerprint(body && body._deviceFingerprint);
+      if (incomingFp) {
+        try {
+          const wrote = await dbSetIfAbsent(env, `${userPath}/deviceFingerprint`, incomingFp);
+          if (wrote) {
+            user.deviceFingerprint = incomingFp;
+            await guardNewAccountDevice(env, telegramId, incomingFp);
+          }
+        } catch (err) {
+          console.error(`fingerprint backfill failed for ${telegramId}:`, err);
+        }
+      }
+    }
     await registerReferralIfNeeded(env, user, startParam, config);
   }
 
