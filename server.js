@@ -338,7 +338,23 @@ const MAG_MANUAL_BLOCKS_PATH = 'blocked_accounts';
 // ملحوظة: الدالة دي بقت fail-closed — لو قراءة Firebase فشلت بترمي الخطأ
 // (بدل ما ترجّع false وتسيب المحظور يعدّي). اللي بينادي عليها مسؤول عن
 // التعامل مع الخطأ (handleFetch بيرجّع 503).
-async function checkUserBlocked(env, userId) {
+// نتيجة "مش محظور" بتتخزن 10 ثواني فقط (الحظر الفعلي بيتفحص من Firebase
+// بعدها). المحظورين مبيتخزنوش أبدًا، وأي حظر يكتبه السيرفر بيمسح الكاش فورًا.
+// useCache=true بس في المسار العام لكل طلب؛ باقي الاستدعاءات بتقرا مباشرة.
+const BLOCK_CACHE_TTL_MS = 10000;
+const _notBlockedCache = new Map(); // userId -> expireAt
+async function checkUserBlocked(env, userId, useCache = false) {
+  const key = String(userId);
+  if (useCache) {
+    const exp = _notBlockedCache.get(key);
+    if (exp && exp > Date.now()) return false;
+  }
+  const result = await checkUserBlockedUncached(env, userId);
+  if (useCache && !result) _notBlockedCache.set(key, Date.now() + BLOCK_CACHE_TTL_MS);
+  else _notBlockedCache.delete(key);
+  return result;
+}
+async function checkUserBlockedUncached(env, userId) {
   {
     // بنقرا المساريْن مع بعض: حظر النظام التلقائي (blocks/) + الحظر اليدوي
     // من لوحة التحكم (blocked_accounts/). أي واحد منهم موجود = محظور.
@@ -421,6 +437,7 @@ async function applyBlock(env, userId, blockData) {
       deviceFingerprint: blockData.deviceFingerprint || 'Unknown',
       isNewAccount: !!blockData.isNewAccount,
     };
+    _notBlockedCache.delete(String(userId));
     await dbSet(env, `${MAG_BLOCKS_PATH}/${userId}`, blockInfo);
     await dbUpdate(env, `${MAG_USERS_PATH}/${userId}`, {
       isBlocked: true,
@@ -725,8 +742,11 @@ function checkRateLimit(key) {
   return true;
 }
 
+let _lastHashCleanup = 0;
 function cleanupExpiredHashes() {
   const now = Date.now();
+  if (now - _lastHashCleanup < 30000) return;
+  _lastHashCleanup = now;
   for (const [hash, exp] of usedInitDataHashes) {
     if (exp < now) usedInitDataHashes.delete(hash);
   }
@@ -808,6 +828,57 @@ async function verifyTelegramInitData(initData, botToken) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+//  كاش داخل الذاكرة (لتقليل الحمل على Firebase والسيرفر)
+//  • memo(key, ttl, fn): يخزّن النتيجة لمدة ttl ملي ثانية، وأي طلبات
+//    متزامنة لنفس المفتاح بتشارك قراءة واحدة بدل ما كل واحد يقرأ لوحده.
+//  • لو fn رجّعت قيمة فيها _noCache (فشل جزئي) النتيجة لا تُخزَّن.
+// ──────────────────────────────────────────────────────────────────────
+const _memoStore = new Map(); // key -> { val, exp } | { promise }
+async function memo(key, ttlMs, fn) {
+  const hit = _memoStore.get(key);
+  if (hit) {
+    if (hit.promise) return hit.promise;
+    if (hit.exp > Date.now()) return hit.val;
+  }
+  const promise = (async () => fn())();
+  _memoStore.set(key, { promise });
+  try {
+    const val = await promise;
+    if (val && val._noCache) _memoStore.delete(key);
+    else _memoStore.set(key, { val, exp: Date.now() + ttlMs });
+    return val;
+  } catch (err) {
+    _memoStore.delete(key);
+    throw err;
+  }
+}
+// تنضيف دوري للمدخلات المنتهية + حد أقصى للحجم (يمنع تضخم الذاكرة)
+function pruneMemoStore() {
+  const now = Date.now();
+  for (const [k, v] of _memoStore) {
+    if (!v.promise && v.exp <= now) _memoStore.delete(k);
+  }
+  if (_memoStore.size > 20000) {
+    let over = _memoStore.size - 20000;
+    for (const k of _memoStore.keys()) { _memoStore.delete(k); if (--over <= 0) break; }
+  }
+}
+// كتابات السيرفر نفسه على المسارات المكاشة بتمسح الكاش فورًا
+function _invalidateForPath(path, structural) {
+  if (path === 'config' || path.startsWith('config/')) _memoStore.delete('config');
+  else if (path.startsWith('mandatoryChannels')) _memoStore.delete('mandatoryChannels');
+  else if (path === 'tasks' || (structural && path.startsWith('tasks/'))) _memoStore.delete('tasks');
+}
+// تشغيل async على دفعات (بدل آلاف الطلبات في نفس اللحظة)
+async function mapInChunks(items, size, fn) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(...await Promise.all(items.slice(i, i + size).map(fn)));
+  }
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────────────────
 //  Firebase Realtime Database — REST API Helpers
 // ──────────────────────────────────────────────────────────────────────
 function dbUrl(env, path) {
@@ -822,6 +893,7 @@ async function dbGet(env, path) {
 }
 
 async function dbSet(env, path, value) {
+  _invalidateForPath(path, true);
   const res = await fetch(dbUrl(env, path), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -846,6 +918,7 @@ async function dbSetIfAbsent(env, path, value) {
 }
 
 async function dbUpdate(env, path, value) {
+  _invalidateForPath(path, false);
   const res = await fetch(dbUrl(env, path), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -856,6 +929,7 @@ async function dbUpdate(env, path, value) {
 }
 
 async function dbPush(env, path, value) {
+  _invalidateForPath(path, true);
   const res = await fetch(dbUrl(env, path), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -867,6 +941,7 @@ async function dbPush(env, path, value) {
 }
 
 async function dbDelete(env, path) {
+  _invalidateForPath(path, true);
   const res = await fetch(dbUrl(env, path), { method: 'DELETE' });
   if (!res.ok) throw new Error(`Firebase DELETE failed (${res.status}) on ${path}`);
 }
@@ -874,7 +949,15 @@ async function dbDelete(env, path) {
 // ──────────────────────────────────────────────────────────────────────
 //  الإعدادات العامة للمشروع (config/) — كل القيم قابلة للتعديل من Firebase
 // ──────────────────────────────────────────────────────────────────────
+// الإعدادات بتتقرا من Firebase مرة كل 5 ثواني بس (بدل كل طلب). أي تعديل
+// من لوحة التحكم بيوصل خلال 5 ثواني كحد أقصى. كل طلب بياخد نسخة مستقلة
+// عشان أي تعديل محلي على config ما يأثرش على باقي الطلبات.
+const CONFIG_CACHE_TTL_MS = 5000;
 async function getConfig(env) {
+  const cfg = await memo('config', CONFIG_CACHE_TTL_MS, () => getConfigUncached(env));
+  return structuredClone(cfg);
+}
+async function getConfigUncached(env) {
   let config = await dbGet(env, 'config');
   if (!config) config = {};
 
@@ -972,6 +1055,10 @@ async function ensureFixedInviteTasks(env) {
 // غير موجودة بالمرة في Firebase. لو صاحب المشروع مسح كل القنوات يدويًا
 // (عقدة فاضية {}) مش هيتم زرع القناة الافتراضية تاني.
 async function getMandatoryChannels(env) {
+  const list = await memo('mandatoryChannels', 10000, () => getMandatoryChannelsUncached(env));
+  return list.map((c) => ({ ...c }));
+}
+async function getMandatoryChannelsUncached(env) {
   let raw = await dbGet(env, 'mandatoryChannels');
   if (raw === null || raw === undefined) {
     const seed = {};
@@ -1155,8 +1242,13 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) 
         user[key] = tgValue;
       }
     }
-    user.lastLogin = patch.lastLogin;
-    await dbUpdate(env, userPath, patch);
+    // lastLogin بيتكتب مرة كل دقيقة بالكتير (مش مع كل طلب)، إلا لو في بيانات
+    // تليجرام اتغيّرت فعلًا فبتتكتب فورًا.
+    const needLoginWrite = !user.lastLogin || (patch.lastLogin - Number(user.lastLogin)) >= 60000;
+    if (needLoginWrite || Object.keys(patch).length > 1) {
+      user.lastLogin = patch.lastLogin;
+      await dbUpdate(env, userPath, patch);
+    }
 
     // ── ترقيع البصمة: حساب اتعمل من غير بصمة (السكريبت اتأخر/اتحجب، أو حساب
     // قديم قبل النظام ده) بياخد بصمته من أول طلب فيه بصمة سليمة، وبعدين
@@ -1181,7 +1273,7 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) 
   // دعم حالة المستخدم الموجود مسبقًا: لو استوفى الشروط بالفعل،
   // فعّل الإحالة الجديدة فور تسجيلها.
   if (user.forceSubPassed) {
-    await activateReferralIfNeeded(env, user.telegramId, config, botToken);
+    await activateReferralIfNeeded(env, user.telegramId, config, botToken, user);
   }
 
   return user;
@@ -1520,12 +1612,12 @@ async function sendTelegramMessage(env, botToken, chatId, text) {
 // مكافأة الإحالة: نظام يوم واحد فقط. بمجرد ما المُحال يشوف 10 إعلانات
 // (في أي يوم)، تُصرف مكافأة الإحالة للمُحيل مباشرة ومرة واحدة فقط —
 // لا يوجد أي تقسيم للمكافأة على عدة أيام بعد الآن.
-async function activateReferralIfNeeded(env, telegramId, config, botToken) {
+async function activateReferralIfNeeded(env, telegramId, config, botToken, knownUser) {
   // اتلغى بالكامل بناءً على طلبك: مبقاش بيتكتب أي حاجة تحت
   // debug_referral_activation/<telegramId> في Firebase.
   const logActivation = async () => {};
 
-  const user = await dbGet(env, `users/${telegramId}`);
+  const user = knownUser || await dbGet(env, `users/${telegramId}`);
   if (!user || !user.referredBy) {
     await logActivation({ result: 'no_user_or_no_referrer' });
     return;
@@ -1727,18 +1819,24 @@ async function checkUserForceSub(env, telegramId, botToken, config) {
     return { required: false, passed: true, channels: [] };
   }
 
-  const results = [];
-  let allJoined = true;
-  for (const ch of channels) {
+  // فحص كل القنوات بالتوازي (بدل واحدة ورا التانية). نتيجة "منضم" بتتخزن
+  // 30 ثانية؛ نتيجة "غير منضم" مبتتخزنش أبدًا فالانضمام بيظهر فورًا.
+  const joinedFlags = await Promise.all(channels.map(async (ch) => {
+    const ckey = `member:${extractChatIdentifier(ch.link)}:${telegramId}`;
+    const cached = _memoStore.get(ckey);
+    if (cached && !cached.promise && cached.exp > Date.now()) return true;
     const joined = await checkTelegramMembership(env, ch.link, telegramId, botToken);
-    if (!joined) allJoined = false;
-    results.push({
-      id: ch.id,
-      title: ch.title || ch.username || extractChatIdentifier(ch.link) || ch.link,
-      link: ch.link,
-      joined,
-    });
-  }
+    if (joined) _memoStore.set(ckey, { val: true, exp: Date.now() + 30000 });
+    else _memoStore.delete(ckey);
+    return joined;
+  }));
+  const results = channels.map((ch, i) => ({
+    id: ch.id,
+    title: ch.title || ch.username || extractChatIdentifier(ch.link) || ch.link,
+    link: ch.link,
+    joined: joinedFlags[i],
+  }));
+  const allJoined = joinedFlags.every(Boolean);
   return { required: true, passed: allJoined, channels: results };
 }
 
@@ -1781,7 +1879,7 @@ async function handleGetState(env, ctx) {
   const telegramId = user.telegramId;
 
   const [tasksRaw, completedRaw, referralsRaw, logsRaw, withdrawalsRaw, gamePlaysRaw] = await Promise.all([
-    dbGet(env, 'tasks'),
+    memo('tasks', 5000, () => dbGet(env, 'tasks')),
     dbGet(env, `users/${telegramId}/completedTasks`),
     dbGet(env, `referrals/${telegramId}`),
     dbGet(env, `balanceLogs/${telegramId}`),
@@ -1813,18 +1911,33 @@ async function handleGetState(env, ctx) {
   // لسه مادفعتش كل الأيام — دي بتتعامل هنا كـ 'completed' لأن مكافأتها
   // اتصرفت بالفعل (جزئيًا على الأقل) تحت المنطق القديم.
   const referrals = referralsRaw
-    ? await Promise.all(Object.entries(referralsRaw).map(async ([id, r]) => {
-        const [referredUser, blockedAuto, blockedManual, referredLogs] = await Promise.all([
-          dbGet(env, `users/${id}`).catch(() => null),
-          dbGet(env, `${MAG_BLOCKS_PATH}/${id}`).catch(() => null),
-          dbGet(env, `${MAG_MANUAL_BLOCKS_PATH}/${id}`).catch(() => null),
-          dbGet(env, `balanceLogs/${id}`).catch(() => null),
-        ]);
+    ? await mapInChunks(Object.entries(referralsRaw), 20, async ([id, r]) => {
+        // بيانات كل إحالة (4 قراءات) بتتخزن 30 ثانية، والدفعات بـ 20 في المرة
+        // بدل آلاف الطلبات المتزامنة لو عند المستخدم إحالات كتير.
+        const info = await memo(`refinfo:${id}`, 30000, async () => {
+          let failed = false;
+          const safe = (p) => dbGet(env, p).catch(() => { failed = true; return null; });
+          const [ru, ba, bm, rl] = await Promise.all([
+            safe(`users/${id}`),
+            safe(`${MAG_BLOCKS_PATH}/${id}`),
+            safe(`${MAG_MANUAL_BLOCKS_PATH}/${id}`),
+            safe(`balanceLogs/${id}`),
+          ]);
+          const logsArr = rl ? Object.values(rl) : [];
+          return {
+            referredUser: ru ? {
+              firstName: ru.firstName, lastName: ru.lastName, username: ru.username,
+              photoUrl: ru.photoUrl, totalAdsWatched: ru.totalAdsWatched,
+            } : null,
+            blockedAuto: ba, blockedManual: bm,
+            totalEarned: logsArr
+              .filter((l) => Number(l.amount || 0) > 0 && l.type !== 'referral_commission')
+              .reduce((sum, l) => sum + Number(l.amount || 0), 0),
+            _noCache: failed,
+          };
+        });
+        const { referredUser, blockedAuto, blockedManual, totalEarned } = info;
         const adsWatched = Number(referredUser?.totalAdsWatched || 0);
-        const logs = referredLogs ? Object.values(referredLogs) : [];
-        const totalEarned = logs
-          .filter((l) => Number(l.amount || 0) > 0 && l.type !== 'referral_commission')
-          .reduce((sum, l) => sum + Number(l.amount || 0), 0);
         const referrerEarned = logsRaw
           ? Object.values(logsRaw)
               .filter((l) => l.type === 'referral_commission' && String(l.relatedUser) === String(id))
@@ -1856,7 +1969,7 @@ async function handleGetState(env, ctx) {
           fraudMultipleAccounts,
           fraudReason: blocked?.reason || '',
         };
-      }))
+      })
     : [];
 
   const balanceLogs = logsRaw
@@ -1978,9 +2091,18 @@ function todayKeyCairoFromTimestamp(ts) {
 // المستخدم "أونلاين" دلوقتي. مكانش فيه راوت مسجَّل لـ /heartbeat أصلًا،
 // فكان بيرجع 404 كل شوية في الـ Console. مجرد تحديث بسيط لوقت آخر ظهور،
 // من غير أي منطق تاني (مفيش مكافآت هنا).
+// الواجهة بتبعت heartbeat كل 25 ثانية؛ بنكتب lastActiveAt في Firebase مرة
+// كل ~50 ثانية بس (نبضة من اتنين) — لسه "أونلاين" بنفس الدقة تقريبًا.
+const HEARTBEAT_WRITE_MIN_MS = 40000;
+const _heartbeatLastWrite = new Map(); // telegramId -> ts
 async function handleHeartbeat(env, ctx) {
   const { user } = ctx;
-  await dbUpdate(env, `users/${user.telegramId}`, { lastActiveAt: Date.now() });
+  const key = String(user.telegramId);
+  const now = Date.now();
+  if (now - (_heartbeatLastWrite.get(key) || 0) >= HEARTBEAT_WRITE_MIN_MS) {
+    _heartbeatLastWrite.set(key, now);
+    await dbUpdate(env, `users/${user.telegramId}`, { lastActiveAt: now });
+  }
   return ok({ ok: true });
 }
 
@@ -2771,10 +2893,9 @@ async function getOrInitWeeklyContestState(env, config) {
 // العدد. عند تساوي العدد بين مستخدمين، يتم تفضيل من بدأ الدعوة أبكر
 // (أقدم إحالة له ضمن الفترة) كتقريب عملي لـ"مين وصل للرقم ده الأول".
 async function computeWeeklyReferralLeaderboard(env, startTs, endTs) {
-  const [allReferrals, allUsers] = await Promise.all([
-    dbGet(env, 'referrals'),
-    dbGet(env, 'users'),
-  ]);
+  // كان بيقرا جدول users كله (آلاف المستخدمين) في كل مرة — دلوقتي بنقرا
+  // بيانات (الاسم/اليوزر/الصورة) لأول 25 مركز فقط بعد الترتيب.
+  const allReferrals = await dbGet(env, 'referrals');
   const rows = [];
   if (allReferrals) {
     for (const [referrerId, refs] of Object.entries(allReferrals)) {
@@ -2794,12 +2915,11 @@ async function computeWeeklyReferralLeaderboard(env, startTs, endTs) {
         }
       }
       if (count > 0) {
-        const u = (allUsers && allUsers[referrerId]) || {};
         rows.push({
           telegramId: referrerId,
-          firstName: u.firstName || '',
-          username: u.username || '',
-          photoUrl: u.photoUrl || '',
+          firstName: '',
+          username: '',
+          photoUrl: '',
           count,
           earliestTs,
         });
@@ -2811,8 +2931,28 @@ async function computeWeeklyReferralLeaderboard(env, startTs, endTs) {
     if (a.earliestTs !== b.earliestTs) return a.earliestTs - b.earliestTs;
     return String(a.telegramId).localeCompare(String(b.telegramId));
   });
+  await attachLeaderboardProfiles(env, rows);
   return rows;
 }
+
+// بيانات العرض (الاسم/اليوزر/الصورة) لأول LEADERBOARD_PROFILE_LIMIT مركز بس —
+// دي اللي بتتعرض في الواجهة (TOP_LIMIT = 25) وبتتحط في سجل الجوائز (أول 10).
+const LEADERBOARD_PROFILE_LIMIT = 25;
+async function attachLeaderboardProfiles(env, rows) {
+  await mapInChunks(rows.slice(0, LEADERBOARD_PROFILE_LIMIT), 25, async (row) => {
+    try {
+      const prof = await memo(`prof:${row.telegramId}`, 60000, async () => {
+        const u = (await dbGet(env, `users/${row.telegramId}`)) || {};
+        return { firstName: u.firstName || '', username: u.username || '', photoUrl: u.photoUrl || '' };
+      });
+      row.firstName = prof.firstName; row.username = prof.username; row.photoUrl = prof.photoUrl;
+    } catch (_) { /* نكمل بقيم فاضية زي الأول */ }
+  });
+}
+// نتيجة التصنيف بتتخزن 20 ثانية للطلبات العادية (فتح صفحة التصنيف). توزيع
+// الجوائز بينادي compute مباشرة من غير كاش عشان يحسب بأحدث بيانات.
+const LEADERBOARD_CACHE_TTL_MS = 20000;
+const cachedLeaderboard = (key, fn) => memo(`lb:${key}`, LEADERBOARD_CACHE_TTL_MS, fn);
 
 // يوزّع جوائز أسبوع منتهى (لو مش اتوزعت قبل كده) ثم يبدأ فترة جديدة
 // فورًا بعده (استمرارية بدون فجوة زمنية بين الأسابيع). بيستخدم
@@ -2913,7 +3053,7 @@ async function ensureWeeklyContestUpToDate(env, config) {
 async function handleGetWeeklyLeaderboard(env, ctx) {
   const { user, config } = ctx;
   const state = await ensureWeeklyContestUpToDate(env, config);
-  const leaderboard = await computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs);
+  const leaderboard = await cachedLeaderboard(`ref:${state.startTs}:${state.endTs}`, () => computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs));
   const prizes = weeklyContestPrizes(config);
 
   const TOP_LIMIT = 25;
@@ -2968,22 +3108,19 @@ async function getOrInitAdsContestState(env, config) {
 }
 
 async function computeAdsLeaderboard(env, periodId) {
-  const [counts, allUsers] = await Promise.all([
-    dbGet(env, `adsContest/counts/${periodId}`),
-    dbGet(env, 'users'),
-  ]);
+  const counts = await dbGet(env, `adsContest/counts/${periodId}`);
   const rows = [];
   for (const [tid, c] of Object.entries(counts || {})) {
     const count = Number(c?.count || 0);
     if (count <= 0) continue;
-    const u = (allUsers && allUsers[tid]) || {};
     rows.push({
-      telegramId: tid, firstName: u.firstName || '', username: u.username || '',
-      photoUrl: u.photoUrl || '', count, earliestTs: Number(c?.lastTs || 0),
+      telegramId: tid, firstName: '', username: '',
+      photoUrl: '', count, earliestTs: Number(c?.lastTs || 0),
     });
   }
   // التعادل: اللي وصل للرقم أولًا (أقدم آخر مشاهدة) يتقدم
   rows.sort((a, b) => (b.count - a.count) || (a.earliestTs - b.earliestTs) || String(a.telegramId).localeCompare(String(b.telegramId)));
+  await attachLeaderboardProfiles(env, rows);
   return rows;
 }
 
@@ -3056,12 +3193,12 @@ const COMPETITION_TYPES = {
   referral: {
     label: 'Referral Leaderboard', scoreLabel: 'Active Referrals',
     ensure: (env, config) => ensureWeeklyContestUpToDate(env, config),
-    compute: (env, state) => computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs),
+    compute: (env, state) => cachedLeaderboard(`ref:${state.startTs}:${state.endTs}`, () => computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs)),
   },
   ads: {
     label: 'Ads Leaderboard', scoreLabel: 'Ads Watched',
     ensure: (env, config) => ensureAdsContestUpToDate(env, config),
-    compute: (env, state) => computeAdsLeaderboard(env, state.periodId || makeAdsPeriodId(state.startTs)),
+    compute: (env, state) => { const pid = state.periodId || makeAdsPeriodId(state.startTs); return cachedLeaderboard(`ads:${pid}`, () => computeAdsLeaderboard(env, pid)); },
   },
 };
 
@@ -3494,7 +3631,7 @@ async function handleFetch(request, env) {
       const tgIdStr = String(verification.user.id);
       let blockCheck;
       try {
-        blockCheck = await checkUserBlocked(env, tgIdStr);
+        blockCheck = await checkUserBlocked(env, tgIdStr, true);
       } catch (blockErr) {
         console.error('Block check failed (fail-closed):', blockErr);
         return fail('Service temporarily unavailable, please try again.', 503);
@@ -3597,6 +3734,18 @@ server.listen(PORT, '0.0.0.0', () => {
 //  موجودة برضه هنا، فحتى لو الفحص الدوري ده اتنادى في نفس اللحظة اللي
 //  حد بيفتح فيها البوت، مش هيحصل صرف مرتين لنفس الأسبوع).
 // ════════════════════════════════════════════════════════════════════
+// تنضيف دوري للخرائط اللي في الذاكرة (كانت بتكبر ومفيش حد بيمسحها) —
+// rateLimitStore كان بيكبر مع كل IP جديد للأبد.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, arr] of rateLimitStore) {
+    if (!arr.length || now - arr[arr.length - 1] > RATE_LIMIT_WINDOW_MS) rateLimitStore.delete(k);
+  }
+  for (const [k, exp] of _notBlockedCache) if (exp <= now) _notBlockedCache.delete(k);
+  for (const [k, ts] of _heartbeatLastWrite) if (now - ts > 10 * 60 * 1000) _heartbeatLastWrite.delete(k);
+  pruneMemoStore();
+}, 60 * 1000);
+
 const WEEKLY_CONTEST_CHECK_INTERVAL_MS = 60 * 1000; // كل دقيقة
 let weeklyContestTickRunning = false;
 setInterval(async () => {
