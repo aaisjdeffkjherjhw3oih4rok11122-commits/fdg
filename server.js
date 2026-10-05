@@ -78,7 +78,15 @@ const DEFAULT_CONFIG = {
     monetix: { reward: 200, dailyLimit: 10 },
   },
   minWithdrawal: 50000,        // أقل مبلغ يمكن سحبه (SHIBA)
-  tonConversionRate: 10000,    // 10,000 PMT = 1 TON
+  tonConversionRate: 10000,    // (قديم — لم يعد مستخدمًا)
+  // ═══════ عملة الدولار (USDT على شبكة TON) ═══════
+  // الرصيد بالدولار، والإيداع/السحب بيتم فعليًا بعملة TON بسعر الصرف ده.
+  // قابل للتعديل من Firebase تحت config/usdPerTon (الافتراضي: 1 TON = 1.5 دولار).
+  usdPerTon: 1.5,
+  // أقل مبلغ للسحب بالدولار — قابل للتعديل من Firebase تحت config/minWithdrawalUsd
+  minWithdrawalUsd: 0.1,
+  usdConversionRate: 10000,    // 10,000 PMT = 1 دولار (config/usdConversionRate)
+  taskPricePer100Usd: 0.225,   // سعر كل 100 عضو في ترويج القناة بالدولار (= 0.15 TON × 1.5)
 
   // ── Cloudflare Turnstile (CAPTCHA) ─────────────────────────────
   // turnstileSiteKey يُرسل للواجهة الأمامية (Public). turnstileSecretKey
@@ -117,7 +125,36 @@ const DEFAULT_CONFIG = {
 };
 
 // عنوان محفظة الإيداع مأخوذ من نظام الإيداع العامل (server 58).
+// عدد إعلانات Adsgram المطلوبة قبل أي سحب (ثابت)
+const WITHDRAW_ADS_REQUIRED = 20;
 const DEPOSIT_RECEIVER_WALLET = 'UQAACNWWtTtN7ILkhRERwYUTzo06Bd1Tv_8Yk5gPioIMFoUD';
+
+// ───────── دوال العملة (دولار ↔ TON) ─────────
+// سعر 1 TON بالدولار من config/usdPerTon (الافتراضي 1.5).
+function getUsdPerTon(config) {
+  const r = Number(config && config.usdPerTon);
+  return Number.isFinite(r) && r > 0 ? r : DEFAULT_CONFIG.usdPerTon;
+}
+// عدد الـ PMT المقابل لـ 1 دولار.
+function getPmtPerUsd(config) {
+  const r = Number(config && config.usdConversionRate);
+  return Number.isFinite(r) && r > 0 ? r : DEFAULT_CONFIG.usdConversionRate;
+}
+const round4 = (n) => Number(Number(n).toFixed(4));
+// رصيد الدولار للمستخدم. المستخدمين القدام اللي عندهم tonBalance بس
+// بيتحول رصيدهم تلقائيًا (TON × سعر الصرف) أول ما يتقرأ/يتكتب.
+function readUsdBalance(user, config) {
+  if (user && user.usdBalance !== undefined && user.usdBalance !== null) {
+    return Number(user.usdBalance) || 0;
+  }
+  return round4(Number(user?.tonBalance || 0) * getUsdPerTon(config));
+}
+// يكتب رصيد الدولار ويصفّر tonBalance القديم (اتحول خلاص).
+async function writeUsdBalance(env, telegramId, usd, extra = {}) {
+  const value = Number(Number(usd).toFixed(6));
+  await dbUpdate(env, `users/${telegramId}`, { usdBalance: value, tonBalance: 0, ...extra });
+  return value;
+}
 
 // ───────── مهام الدعوة (Invite) الثابتة — تُنشأ مرة واحدة فقط إذا لم تكن
 // موجودة، وبعد ذلك تصبح قابلة للتعديل بالكامل من Firebase (لا يتم
@@ -1051,6 +1088,7 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken, body) 
       languageCode: tgUser.language_code || '',
       balance: 0,
       tonBalance: 0,
+      usdBalance: 0,
       wallet: '',
       referralCode,
       referredBy: null,
@@ -1378,25 +1416,25 @@ async function incrementBalance(env, telegramId, amount) {
   return newBalance;
 }
 
-async function chargeTonBalance(env, telegramId, amount) {
+async function chargeUsdBalance(env, telegramId, amount, config) {
   const user = await dbGet(env, `users/${telegramId}`);
-  const balance = Number(user?.tonBalance || 0);
+  const balance = readUsdBalance(user, config);
   const charge = Number(amount);
   if (!Number.isFinite(charge) || charge <= 0) {
-    return { ok: false, error: 'Invalid TON task price' };
+    return { ok: false, error: 'Invalid task price' };
   }
   if (balance < charge) {
-    return { ok: false, error: `Insufficient TON balance. You need ${charge.toFixed(4)} TON.` };
+    return { ok: false, error: `Insufficient USD balance. You need $${charge.toFixed(4)}.` };
   }
-  const newBalance = Number((balance - charge).toFixed(4));
-  await dbUpdate(env, `users/${telegramId}`, { tonBalance: newBalance });
+  const newBalance = Number((balance - charge).toFixed(6));
+  await writeUsdBalance(env, telegramId, newBalance);
   await addBalanceLog(env, telegramId, {
     type: 'task_promotion_payment',
     amount: -charge,
-    currency: 'TON',
+    currency: 'USD',
     ts: Date.now(),
   });
-  return { ok: true, tonBalance: newBalance };
+  return { ok: true, usdBalance: newBalance };
 }
 
 // أقصى عدد سجلات بلانس لوج يتم الاحتفاظ بيها لكل مستخدم. بعد كل عملية
@@ -1858,7 +1896,7 @@ async function handleGetState(env, ctx) {
   const wheelSpinsAvailable = computeSpinsAvailable(activeReferralsCount, wheelSpinsUsed);
 
   return ok({
-    user: { ...user, completedTasks },
+    user: { ...user, completedTasks, usdBalance: readUsdBalance(user, config), tonBalance: 0 },
     balance: user.balance || 0,
     tasks,
     completedTasks,
@@ -1871,7 +1909,7 @@ async function handleGetState(env, ctx) {
       reward: Number(config.miningReward ?? DEFAULT_CONFIG.miningReward),
       durationMs: Number(config.miningDurationMs ?? DEFAULT_CONFIG.miningDurationMs),
     },
-    tonBalance: Number(user.tonBalance || 0),
+    usdBalance: readUsdBalance(user, config),
     wheel: {
       segments: WHEEL_SEGMENTS.map((s) => s.reward),
       spinsAvailable: wheelSpinsAvailable,
@@ -1944,6 +1982,12 @@ async function handleHeartbeat(env, ctx) {
   const { user } = ctx;
   await dbUpdate(env, `users/${user.telegramId}`, { lastActiveAt: Date.now() });
   return ok({ ok: true });
+}
+
+// علامة إن المستخدم شاف رسالة الترحيب بالموسم الجديد (تظهر مرة واحدة بس)
+async function handleMarkWelcomeSeen(env, ctx) {
+  await dbUpdate(env, `users/${ctx.user.telegramId}`, { welcomeSeen: true });
+  return ok({ welcomeSeen: true });
 }
 
 async function handleClaimDailyBonus(env, ctx) {
@@ -2549,17 +2593,17 @@ async function handleSubmitTaskSuggestion(env, ctx) {
   }
 
   const units = Math.ceil(membersNeeded / 100);
-  const pricePer100Ton = Number(config.pricePer100MembersTon ?? DEFAULT_CONFIG.pricePer100MembersTon);
+  const pricePer100TaskUsd = Number(config.taskPricePer100Usd ?? DEFAULT_CONFIG.taskPricePer100Usd);
   const pricePer100Shiba = Number(config.pricePer100MembersShiba ?? DEFAULT_CONFIG.pricePer100MembersShiba);
   const pricePer100Usd = Number(config.pricePer100MembersUsd ?? DEFAULT_CONFIG.pricePer100MembersUsd);
   const priceShiba = units * pricePer100Shiba;
   const priceUsd = units * pricePer100Usd;
-  const priceTon = Number((units * pricePer100Ton).toFixed(4));
+  const priceUsdTask = Number((units * pricePer100TaskUsd).toFixed(4));
   if (category === 'channels') {
     const botCheck = await checkBotAdminInChat(link, config.botToken);
     if (!botCheck.ok) return fail(botCheck.error);
   }
-  const payment = await chargeTonBalance(env, user.telegramId, priceTon);
+  const payment = await chargeUsdBalance(env, user.telegramId, priceUsdTask, config);
   if (!payment.ok) return fail(payment.error);
 
   // The bot task is accepted immediately. A channel task is accepted
@@ -2574,15 +2618,15 @@ async function handleSubmitTaskSuggestion(env, ctx) {
       ownerTelegramId: user.telegramId,
       reward: Number(config.taskDefaultReward ?? DEFAULT_CONFIG.taskDefaultReward),
        status: 'active',
-      paymentCurrency: 'TON',
-      paymentAmountTon: priceTon,
+      paymentCurrency: 'USD',
+      paymentAmountUsd: priceUsdTask,
       membersNeeded,
        createdAt: Date.now(),
     });
     return ok({
       taskId,
-      priceTon,
-      tonBalance: payment.tonBalance,
+      priceUsd: priceUsdTask,
+      usdBalance: payment.usdBalance,
       acceptedInstantly: true,
       botAdminVerified: category === 'channels',
     });
@@ -2801,20 +2845,20 @@ async function finalizeAndAdvanceWeeklyPeriod(env, config, state) {
       if (!row || !(prizeTon > 0)) continue;
       try {
         const freshUser = await dbGet(env, `users/${row.telegramId}`);
-        const currentTonBalance = Number(freshUser?.tonBalance || 0);
-        const newTonBalance = Number((currentTonBalance + prizeTon).toFixed(6));
-        await dbUpdate(env, `users/${row.telegramId}`, { tonBalance: newTonBalance });
+        const currentUsdBalance = readUsdBalance(freshUser, config);
+        const newUsdBalance = Number((currentUsdBalance + prizeTon).toFixed(6));
+        await writeUsdBalance(env, row.telegramId, newUsdBalance);
         await addBalanceLog(env, row.telegramId, {
           type: 'weekly_referral_contest_prize',
           amount: prizeTon,
-          currency: 'TON',
+          currency: 'USD',
           rank: i + 1,
           referralsCount: row.count,
           periodId,
           ts: Date.now(),
         });
         await sendTelegramMessage(env, config.botToken || '', row.telegramId,
-          `🏆 Weekly Referral Contest results!\n\nYou finished #${i + 1} this week with ${row.count} referral${row.count === 1 ? '' : 's'}.\n\n💎 +${prizeTon} TON has been credited to your balance automatically.\n\n🔄 A brand new weekly contest just started — invite friends to compete again!`);
+          `🏆 Weekly Referral Contest results!\n\nYou finished #${i + 1} this week with ${row.count} referral${row.count === 1 ? '' : 's'}.\n\n💎 +$${prizeTon} has been credited to your balance automatically.\n\n🔄 A brand new weekly contest just started — invite friends to compete again!`);
         winners.push({ rank: i + 1, telegramId: row.telegramId, firstName: row.firstName, username: row.username, photoUrl: row.photoUrl, count: row.count, prizeTon });
       } catch (err) {
         // فشل صرف جايزة مستخدم واحد ميوقفش صرف باقي المستخدمين — بنسجل
@@ -2958,14 +3002,14 @@ async function finalizeAndAdvanceAdsPeriod(env, config, state) {
       if (!row || !(prizeTon > 0)) continue;
       try {
         const freshUser = await dbGet(env, `users/${row.telegramId}`);
-        const newTon = Number((Number(freshUser?.tonBalance || 0) + prizeTon).toFixed(6));
-        await dbUpdate(env, `users/${row.telegramId}`, { tonBalance: newTon });
+        const newUsd = Number((readUsdBalance(freshUser, config) + prizeTon).toFixed(6));
+        await writeUsdBalance(env, row.telegramId, newUsd);
         await addBalanceLog(env, row.telegramId, {
-          type: 'ads_contest_prize', amount: prizeTon, currency: 'TON', rank: i + 1,
+          type: 'ads_contest_prize', amount: prizeTon, currency: 'USD', rank: i + 1,
           adsCount: row.count, periodId, ts: Date.now(),
         });
         await sendTelegramMessage(env, config.botToken || '', row.telegramId,
-          `📺 Ads Leaderboard results!\n\nYou finished #${i + 1} this round with ${row.count} ad${row.count === 1 ? '' : 's'} watched.\n\n💎 +${prizeTon} TON has been credited to your balance automatically.\n\n🔄 A new Ads round just started — keep watching to compete again!`);
+          `📺 Ads Leaderboard results!\n\nYou finished #${i + 1} this round with ${row.count} ad${row.count === 1 ? '' : 's'} watched.\n\n💎 +$${prizeTon} has been credited to your balance automatically.\n\n🔄 A new Ads round just started — keep watching to compete again!`);
         winners.push({ rank: i + 1, telegramId: row.telegramId, firstName: row.firstName, username: row.username, count: row.count, prizeTon });
       } catch (err) {
         winners.push({ rank: i + 1, telegramId: row.telegramId, count: row.count, prizeTon, error: String(err && err.message || err) });
@@ -3079,7 +3123,8 @@ async function handleRequestWithdrawal(env, ctx) {
   }
 
   const walletAddress = String(body.walletAddress || '').trim();
-  const amount = Number(parseFloat(body.amountTon));
+  // المبلغ المطلوب سحبه بالدولار (الواجهة بتبعته في amountUsd)
+  const amount = Number(parseFloat(body.amountUsd));
 
   if (!/^([UE]Q)[A-Za-z0-9_-]{46}$/.test(walletAddress)) {
     return fail('Invalid wallet address (must start with UQ/EQ)');
@@ -3090,7 +3135,7 @@ async function handleRequestWithdrawal(env, ctx) {
 
   // قراءة رصيد لحظي (مش الرصيد المخزّن في initData القديم) لمنع التلاعب
   const freshUser = await dbGet(env, `users/${telegramId}`);
-  const balance = Number(freshUser?.tonBalance || 0);
+  const balance = readUsdBalance(freshUser, config);
   const today = todayKeyCairo();
   const adsByCompanyToday = freshUser?.adWatchDate === today
     ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
@@ -3101,32 +3146,35 @@ async function handleRequestWithdrawal(env, ctx) {
   const watchedAds = Number(adsByCompanyToday.adsgram || 0);
   const previousWithdrawals = await dbGet(env, `withdrawals/${telegramId}`);
   const withdrawalCount = previousWithdrawals ? Object.keys(previousWithdrawals).length : 0;
-  const withdrawalRules = [
-    { min: 0.1, ads: 15 },
-    { min: 0.2, ads: 20 },
-    { min: 0.3, ads: 25 },
-  ];
-  const rule = withdrawalRules[Math.min(withdrawalCount, 2)];
+  // شروط السحب ثابتة (من غير مستويات): مشاهدة 20 إعلان Adsgram،
+  // والحد الأدنى للسحب بيتقرا من Firebase (config/minWithdrawalUsd).
+  const minWithdrawUsd = Number(config.minWithdrawalUsd);
+  const rule = {
+    min: Number.isFinite(minWithdrawUsd) && minWithdrawUsd > 0 ? minWithdrawUsd : DEFAULT_CONFIG.minWithdrawalUsd,
+    ads: WITHDRAW_ADS_REQUIRED,
+  };
   if (watchedAds < rule.ads) {
-    return fail(`You must watch ${rule.ads} ads before withdrawal ${withdrawalCount + 1}.`);
+    return fail(`You must watch ${rule.ads} Adsgram ads before withdrawing.`);
   }
   if (amount < rule.min) {
-    return fail(`Minimum withdrawal ${withdrawalCount + 1} is ${rule.min} TON.`);
+    return fail(`Minimum withdrawal is $${rule.min}.`);
   }
   if (amount > balance) {
-    return fail('Insufficient TON balance.');
+    return fail('Insufficient USD balance.');
   }
 
   const feeRate = 0.10;
-  const fee = Number((amount * feeRate).toFixed(4));
-  const netAmount = Number((amount - fee).toFixed(4));
-  const newBalance = balance - amount;
+  const fee = round4(amount * feeRate);
+  const netAmount = round4(amount - fee);
+  // المبلغ اللي هيوصل للمستخدم فعليًا بعملة TON (بسعر الصرف وقت الطلب)
+  const usdPerTon = getUsdPerTon(config);
+  const netTon = round4(netAmount / usdPerTon);
+  const newBalance = Number((balance - amount).toFixed(6));
   // تصفير عداد الإعلانات المستخدم في شرط السحب: العداد أصلاً بيتصفر يوميًا
   // (لأنه مربوط بـ adWatchDate)، وبعد التعديل ده بيتصفر كمان فورًا بعد أي
   // عملية سحب ناجحة، عشان المستخدم يحتاج يشاهد إعلانات جديدة قبل السحب التالي
   // حتى لو لسه في نفس اليوم.
-  await dbUpdate(env, `users/${telegramId}`, {
-    tonBalance: newBalance,
+  await writeUsdBalance(env, telegramId, newBalance, {
     tonWallet: walletAddress,
     adWatchDate: today,
     adsWatchedByCompany: {},
@@ -3135,12 +3183,16 @@ async function handleRequestWithdrawal(env, ctx) {
 
   const withdrawalId = await dbPush(env, `withdrawals/${telegramId}`, {
     walletAddress,
-    amount: netAmount,
-    requestedAmount: amount,
+    amount: netAmount,          // صافي بالدولار
+    requestedAmount: amount,    // المطلوب بالدولار
     fee,
     feeRate,
     netAmount,
-    currency: 'TON',
+    currency: 'USD',
+    // المبلغ المطلوب تحويله فعليًا للمحفظة بعملة TON (للأدمن)
+    payoutCurrency: 'TON',
+    payoutAmountTon: netTon,
+    usdPerTon,
     withdrawalNumber: withdrawalCount + 1,
     adsRequired: rule.ads,
     status: 'pending',
@@ -3156,16 +3208,14 @@ async function handleRequestWithdrawal(env, ctx) {
   await addBalanceLog(env, telegramId, {
     type: 'withdrawal',
     amount: -amount,
-    currency: 'TON',
+    currency: 'USD',
+    payoutAmountTon: netTon,
     status: 'pending',
     withdrawalId,
     ts: Date.now(),
   });
 
   // ── إشعار المستخدم عبر البوت بإنشاء طلب السحب ───────────────────────
-  // رسالة إعلامية فقط (لا تؤثر على نتيجة الطلب حتى لو فشل الإرسال —
-  // sendTelegramMessage نفسها بتبتلع أي خطأ شبكة/توكن من غير ما توقف
-  // باقي الكود، فالسحب بيتسجل بنجاح في كل الأحوال).
   const displayName = user.username
     ? `@${user.username}`
     : (user.firstName || String(telegramId));
@@ -3175,7 +3225,8 @@ async function handleRequestWithdrawal(env, ctx) {
     `🆔 Account ID: "${telegramId}"\n` +
     `💳 Wallet Address:\n"${walletAddress}"\n\n` +
     `━━━━━━━━━━━━━━━\n\n` +
-    `💰 Amount: "${amount}" TON\n` +
+    `💵 Amount: "$${amount}"\n` +
+    `💎 You will receive: "${netTon}" TON (≈ $${netAmount})\n` +
     `📌 Status: 🟡 Processing\n\n` +
     `⏳ Estimated Arrival:\n` +
     `Your withdrawal will be processed and sent to your wallet within 24–72 hours.\n\n` +
@@ -3184,11 +3235,13 @@ async function handleRequestWithdrawal(env, ctx) {
   await sendTelegramMessage(env, botToken || config.botToken || '', telegramId, withdrawalNotifyMessage);
 
   return ok({
-    tonBalance: newBalance,
+    usdBalance: newBalance,
     withdrawalId,
     requestedAmount: amount,
     fee,
     netAmount,
+    netTon,
+    usdPerTon,
     adsWatchedToday: 0,
     adsWatchedByCompany: {},
   });
@@ -3198,28 +3251,39 @@ async function handleRequestWithdrawal(env, ctx) {
 // يسجل BOC المرسل من TonConnect كإيداع معلّق. لا يتم إضافة الرصيد
 // قبل التحقق من المعاملة عبر TonCenter.
 async function handleCreateDeposit(env, ctx) {
-  const { user, body } = ctx;
-  const amount = Number(body.amount);
+  const { user, body, config } = ctx;
+  // المبلغ المطلوب إيداعه بالدولار، والسيرفر هو اللي يحسب مبلغ TON المطلوب
+  // دفعه (الواجهة بتبعت tonAmount للتأكد بس، مش بنعتمد عليه).
+  const amountUsd = Number(body.amountUsd);
+  const clientTon = Number(body.tonAmount);
   const txHash = String(body.txHash || '').trim();
-  if (!Number.isFinite(amount) || amount <= 0 || !txHash) {
+  if (!Number.isFinite(amountUsd) || amountUsd <= 0 || !txHash) {
     return fail('Incomplete deposit data');
+  }
+  const usdPerTon = getUsdPerTon(config);
+  const tonAmount = round4(amountUsd / usdPerTon);
+  if (!Number.isFinite(clientTon) || Math.abs(clientTon - tonAmount) > 0.001) {
+    return fail('Exchange rate changed, please reopen the deposit form and try again');
   }
   const depositId = await dbPush(env, `deposits/${user.telegramId}`, {
     userId: String(user.telegramId),
-    amount,
+    amount: amountUsd,          // بالدولار (اللي هيتضاف للرصيد)
+    amountUsd,
+    tonAmount,                  // اللي المفروض يتدفع فعليًا بعملة TON
+    usdPerTon,                  // سعر الصرف وقت إنشاء الإيداع
     txHash,
     receiver: DEPOSIT_RECEIVER_WALLET,
     status: 'pending',
     ts: Date.now(),
   });
-  return ok({ depositId });
+  return ok({ depositId, tonAmount, usdPerTon });
 }
 
 // ───────────────────────── POST /verifyDeposit ───────────────────────
 // نفس دورة التحقق الموجودة في نظام الإيداع العامل، مع تخزين Firebase
 // وحساب رصيد PMT الحالي بدل KV المستخدم في التطبيق المنفصل.
 async function handleVerifyDeposit(env, ctx) {
-  const { user, body } = ctx;
+  const { user, body, config } = ctx;
   const depositId = String(body.depositId || '').trim();
   if (!depositId) return fail('Deposit ID missing');
   const path = `deposits/${user.telegramId}/${depositId}`;
@@ -3227,9 +3291,16 @@ async function handleVerifyDeposit(env, ctx) {
   if (!deposit) return fail('Deposit not found', 404);
   if (deposit.status === 'completed') {
     const fresh = await dbGet(env, `users/${user.telegramId}`);
-    return ok({ status: 'completed', amount: deposit.amount, tonBalance: Number(fresh?.tonBalance || 0) });
+    return ok({ status: 'completed', amount: deposit.amountUsd ?? deposit.amount, usdBalance: readUsdBalance(fresh, config) });
   }
   if (!env.TONCENTER_API_KEY) return fail('TONCENTER_API_KEY missing', 500);
+
+  // الإيداعات القديمة (قبل التحويل للدولار) كان amount فيها بـ TON
+  const isLegacy = deposit.tonAmount === undefined;
+  const expectedTon = isLegacy ? Number(deposit.amount) : Number(deposit.tonAmount);
+  const creditUsd = isLegacy
+    ? round4(Number(deposit.amount) * getUsdPerTon(config))
+    : Number(deposit.amountUsd ?? deposit.amount);
 
   const response = await fetch(
     `https://toncenter.com/api/v2/getTransactions?address=${DEPOSIT_RECEIVER_WALLET}&limit=20`,
@@ -3241,51 +3312,52 @@ async function handleVerifyDeposit(env, ctx) {
     const inMsg = tx.in_msg;
     if (!inMsg) return false;
     const valueTon = Number(inMsg.value) / 1e9;
-    return Math.abs(valueTon - Number(deposit.amount)) < 0.001 &&
+    return Math.abs(valueTon - expectedTon) < 0.001 &&
       tx.transaction_id?.hash === deposit.txHash;
   });
-  if (!found) return ok({ status: 'pending', tonBalance: Number(user.tonBalance || 0) });
+  if (!found) {
+    const cur = await dbGet(env, `users/${user.telegramId}`);
+    return ok({ status: 'pending', usdBalance: readUsdBalance(cur, config) });
+  }
 
   const freshUser = await dbGet(env, `users/${user.telegramId}`);
-  const tonBalance = Number(freshUser?.tonBalance || 0) + Number(deposit.amount);
-  await dbUpdate(env, `users/${user.telegramId}`, { tonBalance });
+  const usdBalance = Number((readUsdBalance(freshUser, config) + creditUsd).toFixed(6));
+  await writeUsdBalance(env, user.telegramId, usdBalance);
   await dbUpdate(env, path, { status: 'completed', completedAt: Date.now() });
   await addBalanceLog(env, user.telegramId, {
     type: 'deposit',
-    amount: Number(deposit.amount),
-    currency: 'TON',
+    amount: creditUsd,
+    currency: 'USD',
+    paidTon: expectedTon,
     depositId,
     status: 'completed',
     ts: Date.now(),
   });
-  return ok({ status: 'completed', amount: deposit.amount, tonBalance });
+  return ok({ status: 'completed', amount: creditUsd, usdBalance });
 }
 
-// Convert PMT to TON. No external payment or blockchain verification is used.
-async function handleConvertPmtToTon(env, ctx) {
+// Convert PMT to USD. No external payment or blockchain verification is used.
+async function handleConvertPmtToUsd(env, ctx) {
   const { user, body, config } = ctx;
   const pmtAmount = Math.floor(Number(body.pmtAmount));
-  const rate = Number(config.tonConversionRate || DEFAULT_CONFIG.tonConversionRate || 10000);
+  const rate = getPmtPerUsd(config);
   if (!Number.isFinite(pmtAmount) || pmtAmount <= 0) {
     return fail('Invalid amount');
   }
   const freshUser = await dbGet(env, `users/${user.telegramId}`);
   const pmtBalance = Number(freshUser?.balance || 0);
   if (pmtAmount > pmtBalance) return fail('Insufficient PMT balance.');
-  const tonAdded = pmtAmount / rate;
-  const tonBalance = Number(freshUser?.tonBalance || 0) + tonAdded;
-  await dbUpdate(env, `users/${user.telegramId}`, {
-    balance: pmtBalance - pmtAmount,
-    tonBalance,
-  });
+  const usdAdded = pmtAmount / rate;
+  const usdBalance = Number((readUsdBalance(freshUser, config) + usdAdded).toFixed(6));
+  await writeUsdBalance(env, user.telegramId, usdBalance, { balance: pmtBalance - pmtAmount });
   await addBalanceLog(env, user.telegramId, {
-    type: 'pmt_to_ton',
+    type: 'pmt_to_usd',
     amount: -pmtAmount,
     currency: 'PMT',
-    tonAdded,
+    usdAdded,
     ts: Date.now(),
   });
-  return ok({ shibaBalance: pmtBalance - pmtAmount, tonBalance, pmtAmount, tonAdded });
+  return ok({ shibaBalance: pmtBalance - pmtAmount, usdBalance, pmtAmount, usdAdded });
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -3294,6 +3366,7 @@ async function handleConvertPmtToTon(env, ctx) {
 const ROUTES = {
   '/getState': handleGetState,
   '/heartbeat': handleHeartbeat,
+  '/markWelcomeSeen': handleMarkWelcomeSeen,
   '/claimDailyBonus': handleClaimDailyBonus,
   '/redeemCode': handleRedeemCode,
   '/checkSession': handleStartAdView,
@@ -3315,7 +3388,8 @@ const ROUTES = {
   '/requestWithdrawal': handleRequestWithdrawal,
   '/createDeposit': handleCreateDeposit,
   '/verifyDeposit': handleVerifyDeposit,
-  '/convertPmtToTon': handleConvertPmtToTon,
+  '/convertPmtToUsd': handleConvertPmtToUsd,
+  '/convertPmtToTon': handleConvertPmtToUsd, // توافق مع النسخة القديمة من الواجهة
 };
 
 // ════════════════════════════════════════════════════════════════════
