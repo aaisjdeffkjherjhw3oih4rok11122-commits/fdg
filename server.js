@@ -84,7 +84,7 @@ const DEFAULT_CONFIG = {
   // قابل للتعديل من Firebase تحت config/usdPerTon (الافتراضي: 1 TON = 1.5 دولار).
   usdPerTon: 1.5,
   // أقل مبلغ للسحب بالدولار — قابل للتعديل من Firebase تحت config/minWithdrawalUsd
-  minWithdrawalUsd: 0.1,
+  minWithdrawalUsd: 0.2,
   usdConversionRate: 10000,    // 10,000 PMT = 1 دولار (config/usdConversionRate)
   taskPricePer100Usd: 0.225,   // سعر كل 100 عضو في ترويج القناة بالدولار (= 0.15 TON × 1.5)
 
@@ -127,6 +127,10 @@ const DEFAULT_CONFIG = {
 // عنوان محفظة الإيداع مأخوذ من نظام الإيداع العامل (server 58).
 // عدد إعلانات Adsgram المطلوبة قبل أي سحب (ثابت)
 const WITHDRAW_ADS_REQUIRED = 20;
+// أقل مبلغ للسحب بالدولار — ثابت 0.2$ (بيتفرض حتى لو Firebase فيه قيمة قديمة)
+const WITHDRAW_MIN_USD = 0.2;
+// عدد إعلانات Adsgram المطلوبة لصرف مكافأة الإحالة (Adsgram بس)
+const REFERRAL_ADSGRAM_REQUIRED = 10;
 const DEPOSIT_RECEIVER_WALLET = 'UQAACNWWtTtN7ILkhRERwYUTzo06Bd1Tv_8Yk5gPioIMFoUD';
 
 // ───────── دوال العملة (دولار ↔ TON) ─────────
@@ -658,7 +662,7 @@ async function verifyTurnstile(token, ip, secretKey, options = {}) {
     form.set('secret', secretKey);
     form.set('response', token);
     if (ip && ip !== 'unknown') form.set('remoteip', ip);
-    const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    const resp = await fetchT('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
@@ -886,15 +890,52 @@ function dbUrl(env, path) {
   return `${base}/${path}.json`;
 }
 
+// كل طلبات Firebase بتعدي من هنا: (1) timeout عشان مفيش طلب يفضل معلّق للأبد
+// ويكوّم اتصالات، (2) حد أقصى للطلبات المتزامنة — الزيادة بتستنى في طابور
+// بدل ما تفتح مئات الاتصالات مرة واحدة (سبب ephemeral port exhaustion).
+const DB_FETCH_TIMEOUT_MS = 12000;
+const DB_MAX_CONCURRENT = 80;
+let _dbActive = 0;
+const _dbQueue = [];
+function _dbAcquire() {
+  if (_dbActive < DB_MAX_CONCURRENT) { _dbActive++; return Promise.resolve(); }
+  return new Promise((resolve) => _dbQueue.push(resolve));
+}
+function _dbRelease() {
+  const next = _dbQueue.shift();
+  if (next) next(); else _dbActive--;
+}
+async function dbFetch(url, init = {}) {
+  await _dbAcquire();
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(DB_FETCH_TIMEOUT_MS) });
+  } finally {
+    _dbRelease();
+  }
+}
+// fetch عادي (تيليجرام/Turnstile/TON) بس مع timeout
+function fetchT(url, init = {}, ms = 10000) {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
+}
+
+// يرجّع مفاتيح مسار فقط (shallow) من غير تحميل القيم — أخف بكتير.
+async function dbGetKeys(env, path) {
+  const base = env.FIREBASE_DATABASE_URL.replace(/\/$/, '');
+  const res = await dbFetch(`${base}/${path}.json?shallow=true`);
+  if (!res.ok) throw new Error(`Firebase shallow GET failed (${res.status}) on ${path}`);
+  const j = await res.json();
+  return j && typeof j === 'object' ? Object.keys(j) : [];
+}
+
 async function dbGet(env, path) {
-  const res = await fetch(dbUrl(env, path));
+  const res = await dbFetch(dbUrl(env, path));
   if (!res.ok) throw new Error(`Firebase GET failed (${res.status}) on ${path}`);
   return await res.json();
 }
 
 async function dbSet(env, path, value) {
   _invalidateForPath(path, true);
-  const res = await fetch(dbUrl(env, path), {
+  const res = await dbFetch(dbUrl(env, path), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
@@ -907,7 +948,7 @@ async function dbSet(env, path, value) {
 // ترجع true لو الكتابة تمت، false لو في request تاني سبقنا وكتب قيمة في نفس
 // المسار (HTTP 412) — وفي الحالة دي لا يتم استبدال أي شيء.
 async function dbSetIfAbsent(env, path, value) {
-  const res = await fetch(dbUrl(env, path), {
+  const res = await dbFetch(dbUrl(env, path), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', 'if-match': 'null_etag' },
     body: JSON.stringify(value),
@@ -919,7 +960,7 @@ async function dbSetIfAbsent(env, path, value) {
 
 async function dbUpdate(env, path, value) {
   _invalidateForPath(path, false);
-  const res = await fetch(dbUrl(env, path), {
+  const res = await dbFetch(dbUrl(env, path), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
@@ -930,7 +971,7 @@ async function dbUpdate(env, path, value) {
 
 async function dbPush(env, path, value) {
   _invalidateForPath(path, true);
-  const res = await fetch(dbUrl(env, path), {
+  const res = await dbFetch(dbUrl(env, path), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
@@ -942,7 +983,7 @@ async function dbPush(env, path, value) {
 
 async function dbDelete(env, path) {
   _invalidateForPath(path, true);
-  const res = await fetch(dbUrl(env, path), { method: 'DELETE' });
+  const res = await dbFetch(dbUrl(env, path), { method: 'DELETE' });
   if (!res.ok) throw new Error(`Firebase DELETE failed (${res.status}) on ${path}`);
 }
 
@@ -1013,6 +1054,9 @@ async function getConfigUncached(env) {
     config.botToken = env.BOT_TOKEN || '';
     changed = true;
   }
+
+  // فرض حد السحب (في الذاكرة فقط — من غير ما نكتب في Firebase)
+  config.minWithdrawalUsd = WITHDRAW_MIN_USD;
 
   if (changed) {
     try {
@@ -1345,7 +1389,7 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
         status: 'pending',
       });
       await sendTelegramMessage(env, config.botToken || '', referrerId,
-        `👥 New referral joined!\n\n👤 ${user.firstName || user.username || 'A user'} opened Pmt Gram with your link.\n\n⏳ They need to watch 10 ads before you get paid.\n💎 Your reward: +${Number(reward).toLocaleString('en-US')} PMT — credited once, as soon as they finish`);
+        `👥 New referral joined!\n\n👤 ${user.firstName || user.username || 'A user'} opened Pmt Gram with your link.\n\n⏳ They need to watch 10 AdsGram ads before you get paid.\n💎 Your reward: +${Number(reward).toLocaleString('en-US')} PMT — credited once, as soon as they finish`);
     }
 
     user.referredBy = referrerId;
@@ -1374,7 +1418,7 @@ async function findUserByReferralCode(env, code) {
   const url = `${base}/users.json?orderBy=${encodeURIComponent('"referralCode"')}&equalTo=${encodeURIComponent('"' + wanted + '"')}&limitToFirst=1`;
 
   try {
-    const res = await fetch(url);
+    const res = await dbFetch(url);
     if (!res.ok) {
       const msg = `HTTP ${res.status}`;
       console.error(`findUserByReferralCode: indexed query failed (${msg}) — تأكد من إضافة ".indexOn": ["referralCode"] تحت users في Firebase Rules`);
@@ -1540,9 +1584,7 @@ const BALANCE_LOG_MAX_ENTRIES = 15;
 // ترتيب الوقت اللي اتكتبت بيه، فبنرتّبها ونمسح الأقدم بس.
 async function trimBalanceLogs(env, telegramId, maxEntries = BALANCE_LOG_MAX_ENTRIES) {
   try {
-    const all = await dbGet(env, `balanceLogs/${telegramId}`);
-    if (!all) return;
-    const keys = Object.keys(all).sort();
+    const keys = (await dbGetKeys(env, `balanceLogs/${telegramId}`)).sort();
     if (keys.length <= maxEntries) return;
     const toDelete = keys.slice(0, keys.length - maxEntries);
     await Promise.all(toDelete.map((k) => dbDelete(env, `balanceLogs/${telegramId}/${k}`).catch(() => {})));
@@ -1567,14 +1609,15 @@ async function addBalanceLog(env, telegramId, logEntry) {
       const referral = referrerId
         ? await dbGet(env, `referrals/${referrerId}/${telegramId}`)
         : null;
-      const blockCheck = await checkUserBlocked(env, telegramId);
       const commission = Math.floor(Number(logEntry.amount) * 0.10);
       // العمولة 10% تُستحق بمجرد اكتمال (تفعيل) الإحالة — أي بعد صرف
       // مكافأة الإحالة الفردية (status === 'completed'). النظام القديم
       // القائم على 3 أيام (status === 'active') لم يعد له وجود.
-      if (referrerId && referral?.status === 'completed' &&
-          Number(referredUser?.totalAdsWatched || 0) >= 10 &&
-          !(blockCheck && blockCheck.isBlocked) && commission > 0) {
+      // فحص الحظر بنعمله بس لو العمولة هتتصرف فعلًا (وبالكاش القصير)
+      const commissionDue = !!(referrerId && referral?.status === 'completed' &&
+          Number(referredUser?.totalAdsWatched || 0) >= 10 && commission > 0);
+      const blockCheck = commissionDue ? await checkUserBlocked(env, telegramId, true) : null;
+      if (commissionDue && !(blockCheck && blockCheck.isBlocked)) {
         await incrementBalance(env, referrerId, commission);
         await dbPush(env, `balanceLogs/${referrerId}`, {
           type: 'referral_commission',
@@ -1601,7 +1644,7 @@ async function addBalanceLog(env, telegramId, logEntry) {
 async function sendTelegramMessage(env, botToken, chatId, text) {
   if (!botToken || !chatId) return;
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    await fetchT(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: String(chatId), text }),
@@ -1612,6 +1655,16 @@ async function sendTelegramMessage(env, botToken, chatId, text) {
 // مكافأة الإحالة: نظام يوم واحد فقط. بمجرد ما المُحال يشوف 10 إعلانات
 // (في أي يوم)، تُصرف مكافأة الإحالة للمُحيل مباشرة ومرة واحدة فقط —
 // لا يوجد أي تقسيم للمكافأة على عدة أيام بعد الآن.
+// عدد إعلانات Adsgram اللي شافها المستخدم (إعلانات الشركات التانية مش بتتحسب).
+// بياخد الأكبر بين عداد النهارده وعداد إجمالي Adsgram المخزّن.
+function adsgramProgress(u) {
+  if (!u) return 0;
+  const byCompany = u.adWatchDate === todayKeyCairo()
+    ? normalizeAdWatchCounters(u.adsWatchedByCompany, u.adsWatchedToday)
+    : {};
+  return Math.max(Number(byCompany.adsgram || 0), Number(u.totalAdsgramWatched || 0));
+}
+
 async function activateReferralIfNeeded(env, telegramId, config, botToken, knownUser) {
   // اتلغى بالكامل بناءً على طلبك: مبقاش بيتكتب أي حاجة تحت
   // debug_referral_activation/<telegramId> في Firebase.
@@ -1638,9 +1691,8 @@ async function activateReferralIfNeeded(env, telegramId, config, botToken, known
     return;
   }
 
-  const today = todayKeyCairo();
-  const watched = user.adWatchDate === today ? Number(user.adsWatchedToday || 0) : 0;
-  if (watched < 10) {
+  const watched = adsgramProgress(user);
+  if (watched < REFERRAL_ADSGRAM_REQUIRED) {
     await logActivation({ result: 'not_enough_ads_yet', watched });
     return;
   }
@@ -1681,7 +1733,7 @@ async function activateReferralIfNeeded(env, telegramId, config, botToken, known
     ts: Date.now(),
   });
   const referralName = user.firstName || user.username || 'Your referral';
-  const activationMessage = `🎉 Referral activated!\n\n👤 ${referralName} watched 10 ads and is now active.\n\n💎 +${reward.toLocaleString('en-US')} PMT credited 💰 Balance: ${Number(newBalance || 0).toLocaleString('en-US')} PMT\n\n📈 You also earn 10% of everything they make, forever.`;
+  const activationMessage = `🎉 Referral activated!\n\n👤 ${referralName} watched 10 AdsGram ads and is now active.\n\n💎 +${reward.toLocaleString('en-US')} PMT credited 💰 Balance: ${Number(newBalance || 0).toLocaleString('en-US')} PMT\n\n📈 You also earn 10% of everything they make, forever.`;
   await sendTelegramMessage(env, botToken, referrerId, activationMessage);
   await logActivation({ result: 'reward_credited', referrerId, reward });
 }
@@ -1767,7 +1819,7 @@ async function checkTelegramMembership(env, chatLink, telegramId, botToken) {
 
   const url = `https://api.telegram.org/bot${botToken}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${telegramId}`;
   try {
-    const res = await fetch(url);
+    const res = await fetchT(url);
     const result = await res.json();
     if (!result.ok || !result.result?.user) return false;
     if (String(result.result.user.id) !== String(telegramId)) return false;
@@ -1787,12 +1839,12 @@ async function checkBotAdminInChat(chatLink, botToken) {
     return { ok: false, error: 'Use a public Telegram channel link such as https://t.me/yourchannel.' };
   }
   try {
-    const meRes = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+    const meRes = await fetchT(`https://api.telegram.org/bot${botToken}/getMe`);
     const me = await meRes.json();
     if (!me.ok || !me.result?.id) {
       return { ok: false, error: 'Unable to verify the bot account.' };
     }
-    const memberRes = await fetch(
+    const memberRes = await fetchT(
       `https://api.telegram.org/bot${botToken}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${me.result.id}`
     );
     const member = await memberRes.json();
@@ -1914,7 +1966,7 @@ async function handleGetState(env, ctx) {
     ? await mapInChunks(Object.entries(referralsRaw), 20, async ([id, r]) => {
         // بيانات كل إحالة (4 قراءات) بتتخزن 30 ثانية، والدفعات بـ 20 في المرة
         // بدل آلاف الطلبات المتزامنة لو عند المستخدم إحالات كتير.
-        const info = await memo(`refinfo:${id}`, 30000, async () => {
+        const info = await memo(`refinfo:${id}`, 60000, async () => {
           let failed = false;
           const safe = (p) => dbGet(env, p).catch(() => { failed = true; return null; });
           const [ru, ba, bm, rl] = await Promise.all([
@@ -1929,6 +1981,7 @@ async function handleGetState(env, ctx) {
               firstName: ru.firstName, lastName: ru.lastName, username: ru.username,
               photoUrl: ru.photoUrl, totalAdsWatched: ru.totalAdsWatched,
             } : null,
+            adsgramWatched: adsgramProgress(ru),
             blockedAuto: ba, blockedManual: bm,
             totalEarned: logsArr
               .filter((l) => Number(l.amount || 0) > 0 && l.type !== 'referral_commission')
@@ -1937,13 +1990,16 @@ async function handleGetState(env, ctx) {
           };
         });
         const { referredUser, blockedAuto, blockedManual, totalEarned } = info;
-        const adsWatched = Number(referredUser?.totalAdsWatched || 0);
         const referrerEarned = logsRaw
           ? Object.values(logsRaw)
               .filter((l) => l.type === 'referral_commission' && String(l.relatedUser) === String(id))
               .reduce((sum, l) => sum + Number(l.amount || 0), 0)
           : 0;
         const status = (r.status === 'active' || r.status === 'completed') ? 'completed' : 'pending';
+        // التقدم بيتحسب من إعلانات Adsgram بس
+        const adsWatched = status === 'completed'
+          ? REFERRAL_ADSGRAM_REQUIRED
+          : Math.min(Number(info.adsgramWatched || 0), REFERRAL_ADSGRAM_REQUIRED);
         // مكافأة الإحالة تُصرف مرة واحدة فقط — إما اتصرفت بالكامل
         // (completed) أو لسه (pending) وبالتالي = 0.
         const referralRewardEarned = status === 'completed'
@@ -2395,18 +2451,26 @@ async function handleClaimAdReward(env, ctx) {
     if (!Number.isFinite(reward) || reward <= 0) return fail('Invalid ad reward');
     const newBalance = await incrementBalance(env, user.telegramId, reward);
     byCompany[company] = watched + 1;
-    await dbUpdate(env, `users/${user.telegramId}`, {
+    const userUpdate = {
       adWatchDate: today,
       adsWatchedByCompany: byCompany,
       adsWatchedToday: totalAdWatchCounters(byCompany),
       totalAdsWatched: Number(freshUser?.totalAdsWatched || 0) + 1,
-    });
+    };
+    if (company === 'adsgram') {
+      userUpdate.totalAdsgramWatched = Math.max(Number(freshUser?.totalAdsgramWatched || 0), watched) + 1;
+    }
+    await dbUpdate(env, `users/${user.telegramId}`, userUpdate);
     await addBalanceLog(env, user.telegramId, { type: 'ad_reward', amount: reward, date: today, ts: Date.now() });
     // مسابقة الإعلانات: تسجيل المشاهدة (بتوقيت السيرفر) ضمن الجولة الحالية.
     // فشل التسجيل ما يكسرش صرف المكافأة.
     try { await recordAdsContestView(env, config, user.telegramId); } catch (e) { console.error('⚠️ Ads contest record failed:', e.message); }
-    if (watched + 1 >= 10) {
-      await activateReferralIfNeeded(env, user.telegramId, config);
+    // مكافأة الإحالة بتتحسب من إعلانات Adsgram بس، وبنفحصها بس لو المستخدم
+    // جاي من إحالة (من غير قراءات زيادة للمستخدمين العاديين).
+    if (company === 'adsgram' && freshUser?.referredBy) {
+      await activateReferralIfNeeded(env, user.telegramId, config, ctx.botToken, {
+        ...freshUser, ...userUpdate,
+      });
     }
     return ok({
       shibaBalance: newBalance,
@@ -3287,7 +3351,7 @@ async function handleRequestWithdrawal(env, ctx) {
   // والحد الأدنى للسحب بيتقرا من Firebase (config/minWithdrawalUsd).
   const minWithdrawUsd = Number(config.minWithdrawalUsd);
   const rule = {
-    min: Number.isFinite(minWithdrawUsd) && minWithdrawUsd > 0 ? minWithdrawUsd : DEFAULT_CONFIG.minWithdrawalUsd,
+    min: WITHDRAW_MIN_USD,
     ads: WITHDRAW_ADS_REQUIRED,
   };
   if (watchedAds < rule.ads) {
@@ -3439,7 +3503,7 @@ async function handleVerifyDeposit(env, ctx) {
     ? round4(Number(deposit.amount) * getUsdPerTon(config))
     : Number(deposit.amountUsd ?? deposit.amount);
 
-  const response = await fetch(
+  const response = await fetchT(
     `https://toncenter.com/api/v2/getTransactions?address=${DEPOSIT_RECEIVER_WALLET}&limit=20`,
     { headers: { 'X-API-Key': env.TONCENTER_API_KEY } },
   );
@@ -3671,12 +3735,28 @@ async function handleFetch(request, env) {
 // ════════════════════════════════════════════════════════════════════
 import http from 'node:http';
 
+const MAX_BODY_BYTES = 512 * 1024; // أي طلب أكبر من كده بيترفض قبل ما يتحمّل في الذاكرة
+process.on('unhandledRejection', (err) => {
+  console.error('⚠️ unhandledRejection:', err && err.message ? err.message : err);
+});
+
 const server = http.createServer(async (req, res) => {
   try {
     // بنجمع الـ body كامل كـ Buffer عشان نبنيه كـ Web Request (زي ما كان
     // بيوصل لـ Cloudflare Worker).
     const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
+    let received = 0;
+    for await (const chunk of req) {
+      received += chunk.length;
+      if (received > MAX_BODY_BYTES) {
+        res.statusCode = 413;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ success: false, error: 'Payload too large', serverTime: Date.now() }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    }
     const bodyBuffer = chunks.length ? Buffer.concat(chunks) : undefined;
 
     const host = req.headers.host || `localhost:${process.env.PORT || 3000}`;
@@ -3715,6 +3795,11 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ success: false, error: 'A server error occurred: ' + err.message, serverTime: Date.now() }));
   }
 });
+
+// timeouts: بتقفل الاتصالات الخاملة/البطيئة بدل ما تتراكم وتاكل الذاكرة والبورتات
+server.keepAliveTimeout = 65 * 1000;
+server.headersTimeout = 66 * 1000;
+server.requestTimeout = 30 * 1000;
 
 // Railway بيحدد البورت تلقائيًا عن طريق متغير PORT — لازم نسمعه بالظبط
 // وعلى 0.0.0.0 مش على localhost فقط.
