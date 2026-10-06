@@ -75,7 +75,7 @@ const DEFAULT_CONFIG = {
   adCompanies: {
     adsgram: { reward: 200, dailyLimit: 10 },
     gigapub: { reward: 200, dailyLimit: 10 },
-    monetix: { reward: 200, dailyLimit: 10 },
+    adloop: { reward: 200, dailyLimit: 10 },
   },
   minWithdrawal: 50000,        // أقل مبلغ يمكن سحبه (SHIBA)
   tonConversionRate: 10000,    // (قديم — لم يعد مستخدمًا)
@@ -1013,7 +1013,7 @@ async function getConfigUncached(env) {
   // ── إعدادات كل شركة إعلانات (config/adCompanies/<company>) ──────────
   // الحلقة اللي فوق بتضيف "adCompanies" كامل مرة واحدة بس لو مش موجود
   // خالص. لكن لو config/adCompanies كان موجود بالفعل من قبل (زي أي
-  // مشروع شغّال) وبعدين ضفنا شركة جديدة (زي monetix) في DEFAULT_CONFIG،
+  // مشروع شغّال) وبعدين ضفنا شركة جديدة (زي adloop) في DEFAULT_CONFIG،
   // الحلقة مش هتلاحظها لأن adCompanies نفسه مش undefined. عشان كده هنا
   // بنتأكد إن كل شركة معروفة في DEFAULT_CONFIG.adCompanies موجودة فعليًا
   // كنود مستقل جوه config.adCompanies في Firebase، ولو ناقصة بنضيفها
@@ -1440,15 +1440,15 @@ async function findUserByReferralCode(env, code) {
 // ولو مش موجودة، بترجع للقيم الاحتياطية config/adReward و config/adCompanyDailyLimit.
 //
 // شركات الإعلانات المسموح بها حصريًا (نفس الـ3 شركات المستخدمة فعليًا في
-// الواجهة الأمامية: Adsgram / GigaPub / Monetix). أي اسم شركة تاني بييجي
-// في الطلب (بما فيه "monetag" القديمة اللي اتشالت بالكامل) يترفض فورًا
+// الواجهة الأمامية: Adsgram / GigaPub / Adloop). أي اسم شركة تاني بييجي
+// في الطلب (بما فيه أي شركة قديمة اتشالت بالكامل) يترفض فورًا
 // من canonicalAdCompany (بيرجع null) بدل ما ياخد قيمة افتراضية زي الأول.
 // لو حابب تضيف شركة إعلانات جديدة مستقبلًا، أضف اسمها هنا في
 // COMPANY_ALIASES وفي DEFAULT_CONFIG.adCompanies فوق.
 const COMPANY_ALIASES = {
   adsgram: ['adsgram'],
   gigapub: ['gigapub', 'giga', 'gigapub.tech'],
-  monetix: ['monetix', 'monetixads'],
+  adloop: ['adloop', 'adloopnetwork'],
 };
 
 // يرجّع الاسم الموحّد للشركة لو كانت واحدة من الشركات المسموح بها فقط،
@@ -1536,7 +1536,7 @@ function getAllAdCompaniesConfig(config) {
     ...Object.keys(DEFAULT_CONFIG.adCompanies || {}),
     'adsgram',
     'gigapub',
-    'monetix',
+    'adloop',
   ]);
   const result = {};
   for (const company of known) {
@@ -2092,7 +2092,7 @@ async function handleGetState(env, ctx) {
     stats: {
       adsWatchedToday,
       adsWatchedByCompany: adsByCompany,
-      adCompanies: adCompaniesConfig,   // { adsgram: {reward, dailyLimit}, gigapub: {...}, monetix: {...} } لكل شركة
+      adCompanies: adCompaniesConfig,   // { adsgram: {reward, dailyLimit}, gigapub: {...}, adloop: {...} } لكل شركة
       adCompanyDailyLimit,
       adDailyTotalLimit: Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit),
       statsDate: today,
@@ -2207,7 +2207,7 @@ async function handleRedeemCode(env, ctx) {
 }
 
 // ───────────────────────── POST /startAdView ───────────────────────────
-// يُستدعى من الواجهة *قبل* عرض إعلان أي شركة (Adsgram/GigaPub/Monetix)،
+// يُستدعى من الواجهة *قبل* عرض إعلان أي شركة (Adsgram/GigaPub/Adloop)،
 // ويرجّع "adTicket" (توكن عشوائي وحيد الاستخدام، صالح لمدة AD_NONCE_TTL_MS
 // فقط) مربوط بـ telegramId + company + بصمة الجهاز الحالية. /claimAdReward
 // بعد كده يرفض أي طلب مايبقاش معاه adTicket صالح ومطابق — فمينفعش أي
@@ -2216,7 +2216,7 @@ async function handleRedeemCode(env, ctx) {
 async function handleStartAdView(env, ctx) {
   const { user, config, body } = ctx;
   const company = canonicalAdCompany(body.company);
-  // أي اسم شركة غير Adsgram/GigaPub/Monetix يترفض فورًا (لا يُعطى أي
+  // أي اسم شركة غير Adsgram/GigaPub/Adloop يترفض فورًا (لا يُعطى أي
   // قيمة افتراضية زي ما كان بيحصل قبل كده مع monetag).
   if (!company) {
     return fail('Unsupported ad company');
@@ -2322,7 +2322,7 @@ async function handleClaimAdReward(env, ctx) {
   const { user, config, body } = ctx;
   const company = canonicalAdCompany(body.company);
   // نفس القيد الموجود في /startAdView: أي شركة غير الثلاث المسموح بها
-  // (Adsgram/GigaPub/Monetix) يترفض طلبها هنا فورًا.
+  // (Adsgram/GigaPub/Adloop) يترفض طلبها هنا فورًا.
   if (!company) {
     return fail('Unsupported ad company');
   }
@@ -3342,7 +3342,7 @@ async function handleRequestWithdrawal(env, ctx) {
     ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
     : {};
   // شرط السحب بيعتمد فقط على عدد إعلانات Adsgram (الشركات التانية زي
-  // gigapub و monetix بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
+  // gigapub و adloop بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
   // شرط عدد الإعلانات المطلوب قبل السحب)
   const watchedAds = Number(adsByCompanyToday.adsgram || 0);
   const previousWithdrawals = await dbGet(env, `withdrawals/${telegramId}`);
